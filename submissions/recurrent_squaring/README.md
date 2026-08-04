@@ -20,11 +20,23 @@ The model is a bidirectional encoder → one **weight‑tied** squaring cell ite
 `T` times (adaptive depth, rule 4) → place‑value decoder. It is fully learned end
 to end (rules 6–8) and runs through the real evaluator with both depth profiles.
 
+### 100% on Easy T=1 (held-out) — see [`T1_EASY_RESULT.md`](T1_EASY_RESULT.md)
+
+`t1_easy_100.py` reaches **100% exact** on the held-out T=1 test set *and* the
+adversarial `depth_t_1` split (and the full ladder to `T=64`) — but only by using
+N's factorization (the RSA trapdoor). `t1_why_factorization.py` shows that
+generic, compliant features cannot: generalization appears **only** once the
+factors of `N` are exposed. This is the honest boundary of the task — 100% is
+trivial *with* the factorization and infeasible *without* it.
+
 ### Files
 | file | what it is |
 |------|-----------|
 | `submission.py` | the competition submission (`SUBMISSION`) |
 | `ANALYSIS.md` | mathematical analysis, proofs, and empirical evidence |
+| `T1_EASY_RESULT.md` | the 100%-on-Easy-T=1 result, method, and honest catch |
+| `t1_easy_100.py` | **100%** on held-out T=1 + full ladder, via CRT/factorization |
+| `t1_why_factorization.py` | crux: generalization needs N's factors, not generic features |
 | `verify_math.py` | dependency‑free check of the recurrence, periodicity, ladder collapse |
 | `demo_1_memorization_fails.py` | a free per‑`x` embedding memorizes and fails on fresh `x` |
 | `demo_2_residue_faithful.py` | a residue‑faithful tied cell learns `s` and shows the `T`‑plateau |
