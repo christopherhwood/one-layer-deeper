@@ -6,4 +6,5 @@ wandb
 logs
 data/generated
 .codex
-user_subsscratchpad
+user_subs
+scratchpad
