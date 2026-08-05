@@ -15,11 +15,14 @@ one complete modular square.
 | 32-wide ripple, strong-decay grokking run (10,000 steps) | 9.25% | 0.25% | 0.59% | model never interpolates, so no delayed generalization emerges |
 | latent-path CRF decoder, 8 states, oracle product | 63.38% | 0.50% | 1.37% | marginalization improves fitting, not identifiability |
 | latent-path CRF decoder, 16 states, oracle product | 72.00% | 0.50% | 1.17% | more latent capacity becomes a stronger memorization channel |
+| latent quotient + learned `qN` convolution | 0.44% | 0.25% | 0.00% | quotient prior collapses to an arbitrary code |
+| latent quotient + exact candidate `qN`, GRU subtractor | 0.31% | 0.00% | 0.20% | removing multiplication does not fix joint latent learning |
+| latent quotient + exact `qN`, two-state local FST | 0.44% | 0.25% | 0.39% | grounding borrow topology prevents lookup but not semantic ambiguity |
 
-All full-subset probes used 1,500 AdamW updates, batch size 32, seed 74, and the
-same 1,600 E5 T=1 training prompts. The oracle probes are diagnostics only; they
-are not rules-valid submissions and do not supply process labels to a submitted
-model.
+Unless a later section says otherwise, the earlier full-subset probes used
+1,500 AdamW updates, batch size 32, seed 74, and the same 1,600 E5 T=1 training
+prompts. The oracle probes are diagnostics only; they are not rules-valid
+submissions and do not supply process labels to a submitted model.
 
 The next architecture should therefore change the reducer, not merely increase
 T=1 weight or H100 duration. The targeted replacement is a digit-serial learned
@@ -78,3 +81,42 @@ discovering arithmetic roles. Marginalization is useful only if the factor
 graph grounds its states in local carry/borrow/quotient relationships. Encoding
 those relationships strongly enough without crossing the benchmark's
 hard-coded-algorithm boundary is the remaining design problem.
+
+## Grounded quotient marginalization result
+
+`latent_quotient_probe.py` enumerates all 2,048 possible quotient strings. A
+small proposer supplies `p(q | x^2, N)`, while a tied LSD-first decoder explains
+the observed remainder from product digits and candidate `qN` features. Neither
+quotients nor borrow states are labels. With a learned schoolbook `qN`
+convolution, the quotient-prior entropy collapses from about 7.6 nats to 0.21,
+but held-out quotient accuracy is 0% and held-out remainder accuracy is 0.25%.
+Supplying exact candidate `qN` digits changes neither outcome. The proposer and
+decoder establish a confident arbitrary code before multiplication/subtraction
+semantics emerge.
+
+`latent_quotient_fst_probe.py` removes most of that freedom. Its decoder has two
+latent states and only a position-tied local transition
+`(P digit, qN digit, state) -> (R digit, next state)`. It marginalizes the state
+path and quotient, holds the quotient prior uniform during decoder warm-up, and
+then uses a detached decoder posterior to teach the proposer. Unlike the GRU,
+the posterior stays high-entropy instead of collapsing, but it still selects
+the true quotient 0% of the time and gives chance-level endpoint accuracy.
+
+An explicitly non-viable oracle-quotient control establishes the exact
+boundary. With the same FST and training rows, exposing the quotient only to
+the loss yields:
+
+| oracle control metric | train T=1 | held-out T=1 | adversarial T=1 |
+|---|---:|---:|---:|
+| target-conditioned posterior selects true quotient | **99.81%** | **99.50%** | **99.41%** |
+| remainder given the true quotient | 70.88% | **73.50%** | **74.61%** |
+| proposer selects true quotient from `(P,N)` | 4.44% | 2.50% | 4.30% |
+
+Thus the local arithmetic transducer learns and generalizes once its latent
+semantics are fixed, but two problems remain: endpoint marginal likelihood does
+not identify those semantics, and a generic global quotient proposer does not
+learn division. The most credible next route is to eliminate the proposer and
+reuse a local subtract/compare cell as a recurrent or monotone quotient search,
+while finding a rules-valid shallow or consistency signal that fixes the cell's
+semantics. These probes fail the local learning gate, so they do not justify a
+new H100 submission.
