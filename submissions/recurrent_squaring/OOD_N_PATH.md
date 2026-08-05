@@ -261,10 +261,28 @@ earlier), which reached **100% on 8–10-digit `N` trained only on ≤4-digit** 
 because the borrow chain *is* the global comparison, propagated LSB→MSB. So the
 right length-general per-step cell is the **sequential ripple, not the conv.**
 
-**Refined attack (well-motivated, not yet built):** sequential borrow-ripple cell
-(length-general, proven to generalize OOD for one modular op) **+** a residual
-highway *across the composition* (the Proof-2 fix that lets a good cell survive
-deep endpoint-only training). Blocker 3 is then handled because a finite-state
-ripple learned to *exactly* 100% (add/sub already do) composes without decay. The
-conv detour shows the highway alone is not enough — the length-general substrate
-must be the one that can do the global mod-comparison.
+**Refined attack:** sequential borrow-ripple cell (length-general, proven to
+generalize OOD for one modular op) **+** a residual highway *across the
+composition* (the Proof-2 fix). Blocker 3 is then handled because a finite-state
+ripple learned to *exactly* 100% (add/sub already do) composes without decay.
+
+**Built and tested it (`oodn_ripple_highway.py`) — and it fails as naively
+combined.** Additive highway `L ← L + ripple(softmax(L), N)` on the digit-logit
+residue, doubling task, train 1–3 digit: **train ~20% (stalls), OOD 0%.** It does
+not even fit the training task. The reason is specific and instructive: **an
+additive/residual highway suits *refining a latent*, not *replacing a value*.**
+`L ← L + ripple_out` accumulates logits across the K steps, but doubling needs
+the *peak to move* every step (x→2x→4x→…); additive accumulation leaves old peaks
+lingering — a messy target. The passthrough highway worked precisely because it
+refined a **hidden latent** `h` that gradually encodes the answer, not the
+digit-residue directly. So the two proven ingredients **do not compose naively.**
+
+**Properly-motivated next design (open):** carry a **per-position hidden latent**
+`H[B,W,D]` (residual-updated → the refinement-friendly gradient highway) and
+**decode the residue from `H`**, while a length-general **sequential borrow pass**
+supplies the arithmetic and the global mod-comparison, writing updates into `H`.
+This keeps the highway on a latent (where residual works) and the global
+comparison on the ripple (where length-generality works). Building/optimizing
+that 2-axis (positions × compositions) recurrence — essentially a
+borrow-aware, gated Neural-GPU — is the genuine remaining research; it was not
+solved in this session's CPU budget.
