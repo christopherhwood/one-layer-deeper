@@ -59,3 +59,22 @@ odds: length-general modular multiplication is at the ML frontier; this is the
 direct H100 test of whether scale + the right inductive bias cracks it. Each
 candidate derisked on CPU (correctness + learning + budget) before spending an
 attempt.
+
+---
+
+## Frontier attempt: abacus + looped core on E3 (OOD-N)
+
+| # | submission | dataset | score | Max T | OOD-N | steps/60s | notes |
+|---|-----------|---------|-------|-------|-------|-----------|-------|
+| 5 | oodn_abacus | e3 | 1.00% | none | none | 1927 | did NOT fit training (loss stuck ~2.1, train acc ~0) |
+
+**Result (honest):** the abacus (place-value) + looped-attention model — the
+best-known inductive bias for length-general arithmetic — does **not** learn
+`x⁴ mod N` on E3 even in-distribution at H100 scale (60s, ~1927 steps). The loss
+is **stuck**, not slowly descending, so this is an **architecture wall, not a
+step-count wall** — more steps (e.g., Medium's 600s) are unlikely to rescue it.
+This confirms on real H100 what ~25 CPU experiments indicated: **learning
+modular multiplication/reduction as a generalizing function is the open frontier**,
+and neither throughput nor the SOTA length-gen inductive bias breaches it here.
+
+An accessible walkthrough of the task + this model: `walkthrough.html`.

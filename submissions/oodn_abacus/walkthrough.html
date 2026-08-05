@@ -1,0 +1,395 @@
+<title>How a neural net learns modular squaring — a walkthrough</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root{
+    --bg:#EAEDF1; --surface:#F6F8FA; --surface-2:#E1E6EC;
+    --ink:#101720; --muted:#586573; --faint:#8A97A5;
+    --accent:#0E8C7F; --accent-soft:rgba(14,140,127,.12);
+    --signal:#B0670F; --signal-soft:rgba(176,103,15,.13);
+    --hair:#C7D0DA; --hair-strong:#AEB9C6;
+    --shadow:0 1px 2px rgba(16,23,32,.06),0 8px 30px rgba(16,23,32,.07);
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#0B111B; --surface:#121A26; --surface-2:#0F1722;
+      --ink:#DEE6EF; --muted:#8B99AB; --faint:#5E6D7E;
+      --accent:#39D6C0; --accent-soft:rgba(57,214,192,.12);
+      --signal:#F0AE4A; --signal-soft:rgba(240,174,74,.14);
+      --hair:rgba(125,145,166,.20); --hair-strong:rgba(125,145,166,.34);
+      --shadow:0 1px 2px rgba(0,0,0,.3),0 12px 40px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#EAEDF1; --surface:#F6F8FA; --surface-2:#E1E6EC;
+    --ink:#101720; --muted:#586573; --faint:#8A97A5;
+    --accent:#0E8C7F; --accent-soft:rgba(14,140,127,.12);
+    --signal:#B0670F; --signal-soft:rgba(176,103,15,.13);
+    --hair:#C7D0DA; --hair-strong:#AEB9C6;
+    --shadow:0 1px 2px rgba(16,23,32,.06),0 8px 30px rgba(16,23,32,.07);
+  }
+  :root[data-theme="dark"]{
+    --bg:#0B111B; --surface:#121A26; --surface-2:#0F1722;
+    --ink:#DEE6EF; --muted:#8B99AB; --faint:#5E6D7E;
+    --accent:#39D6C0; --accent-soft:rgba(57,214,192,.12);
+    --signal:#F0AE4A; --signal-soft:rgba(240,174,74,.14);
+    --hair:rgba(125,145,166,.20); --hair-strong:rgba(125,145,166,.34);
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 12px 40px rgba(0,0,0,.35);
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    font-size:17px; line-height:1.65; -webkit-font-smoothing:antialiased;
+  }
+  .mono{font-family:ui-monospace,"SF Mono","Cascadia Code","JetBrains Mono",Menlo,Consolas,monospace}
+  .wrap{max-width:760px;margin:0 auto;padding:0 24px}
+  h1,h2,h3{letter-spacing:-.02em;line-height:1.12;text-wrap:balance;font-weight:800}
+  h1{font-size:clamp(2.1rem,6vw,3.4rem);margin:.2em 0 .3em}
+  h2{font-size:clamp(1.4rem,3.4vw,1.9rem);margin:0 0 .5em}
+  p{margin:0 0 1.1em;max-width:66ch}
+  a{color:var(--accent)}
+  .eyebrow{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.72rem;
+    letter-spacing:.22em;text-transform:uppercase;color:var(--accent);font-weight:600}
+  .lede{font-size:clamp(1.05rem,2.2vw,1.28rem);color:var(--muted);max-width:60ch}
+  .kbd,.tok{font-family:ui-monospace,Menlo,Consolas,monospace}
+
+  /* hero */
+  header{position:relative;overflow:hidden;border-bottom:1px solid var(--hair)}
+  header::before{content:"";position:absolute;inset:0;
+    background:
+      radial-gradient(120% 80% at 82% 8%,var(--accent-soft),transparent 60%),
+      linear-gradient(transparent 0 39px,var(--hair) 39px 40px),
+      linear-gradient(90deg,transparent 0 39px,var(--hair) 39px 40px);
+    background-size:auto,40px 40px,40px 40px;opacity:.5;pointer-events:none}
+  .hero{position:relative;padding:64px 0 40px;display:grid;gap:34px;
+    grid-template-columns:1.15fr .85fr;align-items:center}
+  @media (max-width:720px){.hero{grid-template-columns:1fr;padding-top:44px}}
+  .dial{width:100%;max-width:300px;margin:0 auto;filter:drop-shadow(var(--shadow))}
+  .formula{display:inline-flex;gap:.15em;align-items:baseline;flex-wrap:wrap;
+    font-size:clamp(1.1rem,2.6vw,1.5rem);margin:.2em 0 1em}
+  .formula .op{color:var(--muted)} .formula .hot{color:var(--signal);font-weight:700}
+  .badges{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
+  .badge{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.74rem;
+    border:1px solid var(--hair-strong);border-radius:999px;padding:5px 11px;color:var(--muted)}
+
+  /* sections */
+  section{padding:52px 0;border-bottom:1px solid var(--hair)}
+  .step{display:grid;grid-template-columns:auto 1fr;gap:20px;align-items:start}
+  .num{font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:700;
+    font-size:.95rem;color:var(--accent);border:1px solid var(--hair-strong);
+    border-radius:10px;width:40px;height:40px;display:grid;place-items:center;
+    background:var(--surface)}
+  .step h2{margin-top:2px}
+
+  .card{background:var(--surface);border:1px solid var(--hair);border-radius:14px;
+    padding:20px 22px;box-shadow:var(--shadow)}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media (max-width:620px){.grid2{grid-template-columns:1fr}}
+  .callout{border-left:3px solid var(--signal);background:var(--signal-soft);
+    padding:14px 18px;border-radius:0 12px 12px 0;margin:1.2em 0;color:var(--ink)}
+  .callout .eyebrow{color:var(--signal)}
+  figure{margin:1.4em 0}
+  figcaption{font-size:.85rem;color:var(--faint);margin-top:.7em;text-align:center;
+    font-family:ui-monospace,Menlo,Consolas,monospace}
+  .chiprow{display:flex;flex-wrap:wrap;gap:8px;margin:.4em 0 0}
+  .chip{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.78rem;
+    padding:4px 9px;border-radius:7px;background:var(--surface-2);color:var(--muted)}
+  .chip.good{color:var(--accent);background:var(--accent-soft)}
+  .chip.hard{color:var(--signal);background:var(--signal-soft)}
+  ul.clean{margin:.2em 0 1.1em;padding-left:1.1em}
+  ul.clean li{margin:.35em 0}
+  .foot{padding:38px 0 60px;color:var(--faint);font-size:.85rem}
+  svg{display:block;max-width:100%;height:auto}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important}}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:4px}
+</style>
+
+<header>
+  <div class="wrap hero">
+    <div>
+      <div class="eyebrow">One Layer Deeper · a walkthrough</div>
+      <h1>Teaching a network to&nbsp;square and&nbsp;wrap&nbsp;around</h1>
+      <p class="lede">The task looks tiny: given three numbers, predict a fourth.
+        Underneath sits an operation that clocks and cryptographers both lean on —
+        and a machine that has to learn the arithmetic, not memorize the answers.</p>
+      <div class="formula mono">
+        <span class="hot">x</span><span class="op">^(2^</span><span class="hot">T</span><span class="op">)</span>
+        <span class="op">&nbsp;mod&nbsp;</span><span class="hot">N</span>
+      </div>
+      <div class="badges">
+        <span class="badge">square, T times</span>
+        <span class="badge">wrap mod N</span>
+        <span class="badge">no lookup tables</span>
+      </div>
+    </div>
+    <div>
+      <svg class="dial" viewBox="0 0 240 240" role="img"
+           aria-label="A dial with a marker jumping to each repeated-squaring result around a clock of N positions.">
+        <circle cx="120" cy="120" r="104" fill="none" stroke="var(--hair-strong)" stroke-width="1.5"/>
+        <circle cx="120" cy="120" r="104" fill="none" stroke="var(--accent)" stroke-width="2"
+                stroke-dasharray="2 6" opacity=".5"/>
+        <g id="ticks"></g>
+        <path id="hop" fill="none" stroke="var(--accent)" stroke-width="2" opacity=".55"/>
+        <g id="ghosts"></g>
+        <circle id="marker" r="8" fill="var(--signal)"/>
+        <text id="label" x="120" y="126" text-anchor="middle"
+              font-family="ui-monospace,Menlo,monospace" font-size="26" font-weight="700"
+              fill="var(--ink)">·</text>
+        <text x="120" y="150" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+              font-size="10" fill="var(--faint)" id="sub">x^(2^t) mod 23</text>
+      </svg>
+      <figcaption>x = 5, N = 23 — each hop squares the last value, then wraps.</figcaption>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <section>
+    <div class="step">
+      <div class="num">1</div>
+      <div>
+        <div class="eyebrow">The puzzle</div>
+        <h2>Clock arithmetic, squared over and over</h2>
+        <p>Everyone already does one kind of wrap-around math: a clock. Five hours
+          after 10&nbsp;o'clock isn't 15 — it's 3. You went past 12 and wrapped. That
+          "wrap past&nbsp;<span class="mono">N</span> and take the remainder" is written
+          <span class="mono">mod N</span>.</p>
+        <p>Now do just one move, over and over: <b>take your number, square it, and
+          wrap mod&nbsp;N.</b> Then square <i>that</i>, wrap again. Do it
+          <span class="mono">T</span> times. The dial above is exactly this — the amber
+          marker lands on <span class="mono">x</span>, then <span class="mono">x²</span>,
+          then <span class="mono">x⁴</span>, each time bouncing to wherever it lands after
+          wrapping around the ring of <span class="mono">N</span> positions.</p>
+        <div class="callout">
+          <div class="eyebrow">Why anyone cares</div>
+          Repeated squaring mod&nbsp;N is a <b>time-lock</b>. There's no known shortcut to
+          the answer except to actually do the squarings one after another — which is
+          why it's used to build puzzles that can only be opened after a set amount of
+          computation. The whole task is: can a network shortcut what's designed to have
+          no shortcut?
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="step">
+      <div class="num">2</div>
+      <div>
+        <div class="eyebrow">The one idea</div>
+        <h2>It's a single operation, repeated — so learn the step</h2>
+        <p>Look at the dial again: every hop is the <em>same</em> move —
+          "square, then wrap." The answer at <span class="mono">T=4</span> is just the
+          answer at <span class="mono">T=3</span> put through that move one more time.</p>
+        <p>That reframes everything. Instead of learning seven different problems
+          (<span class="mono">T = 1, 2, 4, 8, 16, 32, 64</span>), the model learns
+          <b>one</b> step — squaring-and-wrapping — and applies it again and again.
+          Depth of computation <i>is</i> the clock: to go twice as far in time, loop the
+          same little machine twice as many times. Get the one step exactly right and
+          every depth comes for free.</p>
+        <div class="chiprow">
+          <span class="chip">learn 1 step</span><span class="chip">loop it T times</span>
+          <span class="chip good">→ any T generalizes</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="step">
+      <div class="num">3</div>
+      <div>
+        <div class="eyebrow">Why it's genuinely hard</div>
+        <h2>To handle a new N, it must do the math — not recall it</h2>
+        <p>Here's the twist that makes this a real research problem. The scoring rewards
+          getting it right on <b>moduli the model never trained on</b> (call it "new
+          N"). Two tempting shortcuts both collapse:</p>
+        <ul class="clean">
+          <li><b>Memorize a table.</b> Works for one fixed <span class="mono">N</span>,
+            but a table for one modulus says nothing about a different one. Zero transfer
+            to a new&nbsp;<span class="mono">N</span>.</li>
+          <li><b>Factor N and take a shortcut.</b> For a small
+            <span class="mono">N</span> you could crack it open (this is literally the
+            RSA trapdoor). For a large secret <span class="mono">N</span> you can't —
+            that impossibility is exactly what keeps RSA secure.</li>
+        </ul>
+        <p>So the only route that scales is the honest one: <b>learn the arithmetic of
+          squaring-and-wrapping from the digits themselves</b>, the way you'd learn long
+          multiplication — a procedure that works on numbers it has never seen.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="step">
+      <div class="num">4</div>
+      <div>
+        <div class="eyebrow">The model, in three parts</div>
+        <h2>A small machine built to compute, not to remember</h2>
+        <p>The network reads the three numbers as strings of digits and produces the
+          answer's digits. Three design choices push it toward <i>doing arithmetic</i>.
+          The pipeline:</p>
+
+        <figure>
+          <svg viewBox="0 0 680 250" role="img"
+               aria-label="Pipeline: digit tokens with place-value tags flow into a looped core, then a place-value decoder emits answer digits.">
+            <defs>
+              <marker id="arw" markerWidth="9" markerHeight="9" refX="6" refY="3"
+                      orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="var(--muted)"/></marker>
+            </defs>
+            <!-- input tokens -->
+            <g font-family="ui-monospace,Menlo,monospace" font-size="13" text-anchor="middle">
+              <text x="70" y="24" fill="var(--faint)" font-size="11">N  ·  x  ·  T  (digits)</text>
+              <g>
+                <rect x="20" y="36" width="30" height="30" rx="6" fill="var(--surface)" stroke="var(--hair-strong)"/>
+                <text x="35" y="56" fill="var(--ink)">3</text>
+                <rect x="54" y="36" width="30" height="30" rx="6" fill="var(--surface)" stroke="var(--hair-strong)"/>
+                <text x="69" y="56" fill="var(--ink)">2</text>
+                <rect x="88" y="36" width="30" height="30" rx="6" fill="var(--surface)" stroke="var(--hair-strong)"/>
+                <text x="103" y="56" fill="var(--ink)">3</text>
+              </g>
+              <!-- place tags -->
+              <text x="35" y="82" fill="var(--accent)" font-size="10">10²</text>
+              <text x="69" y="82" fill="var(--accent)" font-size="10">10¹</text>
+              <text x="103" y="82" fill="var(--accent)" font-size="10">10⁰</text>
+              <text x="70" y="102" fill="var(--faint)" font-size="10">place-value tag</text>
+            </g>
+            <line x1="128" y1="55" x2="196" y2="55" stroke="var(--muted)" marker-end="url(#arw)"/>
+
+            <!-- looped core -->
+            <rect x="206" y="20" width="196" height="150" rx="14" fill="var(--accent-soft)"
+                  stroke="var(--accent)"/>
+            <text x="304" y="44" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                  font-size="12" fill="var(--accent)" font-weight="700">LOOPED CORE ×16</text>
+            <g font-family="ui-sans-serif,system-ui" font-size="12" fill="var(--ink)" text-anchor="middle">
+              <text x="304" y="74">one small block,</text>
+              <text x="304" y="92">reused every pass</text>
+            </g>
+            <path d="M330 108 a36 20 0 1 1 -52 0" fill="none" stroke="var(--accent)" stroke-width="2"
+                  marker-end="url(#arw)"/>
+            <text x="304" y="152" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                  font-size="10" fill="var(--muted)">attention = compare all digits at once</text>
+            <line x1="402" y1="95" x2="470" y2="95" stroke="var(--muted)" marker-end="url(#arw)"/>
+
+            <!-- decoder -->
+            <g font-family="ui-monospace,Menlo,monospace" font-size="13" text-anchor="middle">
+              <text x="560" y="44" fill="var(--faint)" font-size="11">answer digits</text>
+              <rect x="486" y="56" width="30" height="30" rx="6" fill="var(--surface)" stroke="var(--signal)"/>
+              <text x="501" y="76" fill="var(--signal)" font-weight="700">1</text>
+              <rect x="520" y="56" width="30" height="30" rx="6" fill="var(--surface)" stroke="var(--signal)"/>
+              <text x="535" y="76" fill="var(--signal)" font-weight="700">8</text>
+              <rect x="554" y="56" width="30" height="30" rx="6" fill="var(--surface)" stroke="var(--signal)"/>
+              <text x="569" y="76" fill="var(--signal)" font-weight="700">9</text>
+              <text x="535" y="112" fill="var(--faint)" font-size="10">decoded by place value,</text>
+              <text x="535" y="126" fill="var(--faint)" font-size="10">aligned to the end</text>
+            </g>
+          </svg>
+          <figcaption>digits + place tags → looped core → answer digits</figcaption>
+        </figure>
+
+        <div class="grid2">
+          <div class="card">
+            <div class="eyebrow">Part A</div>
+            <h3 style="margin:.3em 0 .3em;font-size:1.05rem">Place value, not position</h3>
+            <p style="margin:0;font-size:.95rem;color:var(--muted)">Each digit is tagged
+              with <b>which column it's in</b> — units, tens, hundreds — instead of where
+              it sits in the sentence. "The units digit" then looks the same whether the
+              number has 3 digits or 6, so what it learns on small numbers still applies to
+              bigger ones.</p>
+          </div>
+          <div class="card">
+            <div class="eyebrow">Part B</div>
+            <h3 style="margin:.3em 0 .3em;font-size:1.05rem">One block, looped</h3>
+            <p style="margin:0;font-size:.95rem;color:var(--muted)">A single small block is
+              run many times over. Reuse forces it to learn a <b>reusable operation</b>
+              rather than memorize. Its attention can weigh <b>all digits at once</b> — the
+              global "did we go past N?" check that wrapping needs.</p>
+          </div>
+          <div class="card">
+            <div class="eyebrow">Part C</div>
+            <h3 style="margin:.3em 0 .3em;font-size:1.05rem">Answer by column</h3>
+            <p style="margin:0;font-size:.95rem;color:var(--muted)">The answer is read off
+              one column at a time, aligned to the end — the same place-value idea in
+              reverse — so it produces correct digits no matter how long the answer is.</p>
+          </div>
+          <div class="card">
+            <div class="eyebrow">Throughput</div>
+            <h3 style="margin:.3em 0 .3em;font-size:1.05rem">Enough practice reps</h3>
+            <p style="margin:0;font-size:.95rem;color:var(--muted)">A subtle trap: with big
+              batches the training data feeder stalled, so the model got only ~150 practice
+              steps. A smaller batch gave <b>~10× more</b> — a free fix that helps any
+              model that can actually use the reps.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="step">
+      <div class="num">5</div>
+      <div>
+        <div class="eyebrow">Where it stands — honestly</div>
+        <h2>What already works, and the wall still ahead</h2>
+        <p>Peeling the problem apart, the individual moves are learnable and they
+          <i>do</i> generalize to unseen sizes:</p>
+        <div class="chiprow">
+          <span class="chip good">add — 100%</span>
+          <span class="chip good">add-and-wrap — 100%</span>
+          <span class="chip good">wrap a given number — 97%</span>
+        </div>
+        <p style="margin-top:1.1em">The stubborn part is <b>multiplication with wrap</b> —
+          squaring a many-digit number. Chaining the learnable moves into it, with only
+          the final answer as feedback, is where learning stalls. It's the same reason
+          neural nets are famously shaky at exact long multiplication — and it's precisely
+          the frontier this design is aimed at.</p>
+        <div class="chiprow"><span class="chip hard">square-and-wrap, new N — open</span></div>
+        <div class="callout">
+          <div class="eyebrow">The honest bottom line</div>
+          The competition collapses to <b>one</b> unsolved primitive — learning
+          squaring-and-wrapping as a real procedure that transfers to new moduli. Loop
+          that primitive and every time-depth follows automatically. This model is the
+          best-known bet at that primitive; whether scale plus the right built-in bias is
+          enough is exactly what the live runs are testing.
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div class="foot wrap">
+    A research walkthrough of the "One Layer Deeper" modular-squaring task ·
+    predict <span class="mono">x^(2^T) mod N</span> · figures computed live.
+  </div>
+</main>
+
+<script>
+  (function(){
+    var N=23, x=5, steps=[], v=x%N;
+    for(var i=0;i<9;i++){ steps.push(v); v=(v*v)%N; }
+    var cx=120, cy=120, r=104;
+    function pt(val){ var a=-Math.PI/2 + 2*Math.PI*val/N; return [cx+r*Math.cos(a), cy+r*Math.sin(a)]; }
+    var ticks=document.getElementById('ticks');
+    for(var k=0;k<N;k++){ var p=pt(k); var c=document.createElementNS('http://www.w3.org/2000/svg','circle');
+      c.setAttribute('cx',p[0]); c.setAttribute('cy',p[1]); c.setAttribute('r',2);
+      c.setAttribute('fill','var(--faint)'); c.setAttribute('opacity','.5'); ticks.appendChild(c); }
+    var marker=document.getElementById('marker'), label=document.getElementById('label'),
+        hop=document.getElementById('hop'), ghosts=document.getElementById('ghosts');
+    var i=0;
+    var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion:reduce)').matches;
+    function show(idx){
+      var p=pt(steps[idx]); marker.setAttribute('cx',p[0]); marker.setAttribute('cy',p[1]);
+      label.textContent=steps[idx];
+      if(idx>0){ var a=pt(steps[idx-1]);
+        hop.setAttribute('d','M'+a[0]+' '+a[1]+' Q '+cx+' '+cy+' '+p[0]+' '+p[1]); }
+      else hop.setAttribute('d','');
+      var g=document.createElementNS('http://www.w3.org/2000/svg','circle');
+      g.setAttribute('cx',p[0]); g.setAttribute('cy',p[1]); g.setAttribute('r',3.5);
+      g.setAttribute('fill','var(--accent)'); g.setAttribute('opacity','.35'); ghosts.appendChild(g);
+      while(ghosts.childNodes.length>6) ghosts.removeChild(ghosts.firstChild);
+    }
+    show(0);
+    if(!reduce){ setInterval(function(){ i=(i+1)%steps.length; if(i===0){ghosts.innerHTML='';} show(i); }, 1250); }
+  })();
+</script>
