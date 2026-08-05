@@ -286,3 +286,53 @@ comparison on the ripple (where length-generality works). Building/optimizing
 that 2-axis (positions × compositions) recurrence — essentially a
 borrow-aware, gated Neural-GPU — is the genuine remaining research; it was not
 solved in this session's CPU budget.
+
+### Consolidated frontier assessment — the single irreducible problem
+
+Across ~25 controlled experiments the wall has one location, and it gates **all
+three tiers** (it is required even to solve **Easy's** certified-depth metric
+compliantly, because that metric scores **fresh x**, and a fresh non-quadratic-
+residue unit is *unreachable* from training orbits — see §4 — so its square can
+only be gotten by **computing** `x² mod N`, not by coverage/lookup):
+
+> **Learn modular multiplication / reduction as a generalizing FUNCTION (not a
+> memorized table), from endpoint-only supervision.**
+
+What is settled:
+
+* **Single positional ops learn and length-generalize** — `a+b` (100%, ≤6→14
+  digit), `(a+b) mod N` (100%, ≤4→10-digit `N`), `s mod N` given `s` (97%). These
+  are one LSB→MSB pass with a small latent carry/borrow state.
+* **Multiplication/squaring is not a single pass** — it is `Σ uᵢuⱼ·base^{i+j}`
+  then reduce; equivalently, forming the product is *linear* in a digit
+  outer-product, so the irreducible hard core is **modular reduction of a large
+  number** (long division). Every decomposition of it — bit-serial double-and-add,
+  tree-sum, digit-serial remainder — is a **composition whose intermediates are
+  latent** under endpoint-only labels.
+* **Composition of latent intermediates does not learn algorithmically.** Proven
+  repeatedly: straight-through blocks gradients (Proof-1/2); annealed-soft frees
+  them but a *good cell composes while a from-scratch composition does not train*
+  (tree-sum stalls at ~8–10% even shallow+annealed+length-general). The
+  small-domain "successes" (N<10 ≈95%, fixed-width ≈97%) were **memorization** of
+  a few-hundred–few-thousand `(x,N)` table, not algorithm learning — they show 0%
+  OOD-N.
+* **Residual highways help (61→97%) but only on a hidden latent, and only where
+  the domain is memorizable;** they do not compose with the length-general
+  digit substrate (additive highway ≠ digit replacement).
+
+**Conclusion.** The competition reduces cleanly (recurrence ⇒ one squaring;
+squaring ⇒ one modular multiply/reduce), and everything *except* that one
+primitive is solved. That primitive — **length-general, endpoint-only,
+exact modular reduction** — is an open problem in the "learning to execute
+arithmetic algorithms" line of ML research (it is exactly where multi-digit
+multiplication/division length-generalization is still unsolved). Cracking it is
+unlikely by brute-force gradient descent on a composition (every such variant
+here fails); the credible routes are (a) **SOTA length-generalization machinery**
+— abacus/relative digit-position embeddings, looped/recurrent transformers, index
+hints — trained at **real (H100) scale**, or (b) **TRM/HRM-style deep supervision
+with 1-step (detached) gradients**, using the observed `T`-rung residues as legit
+process labels for the *outer* recurrence (this provably removes the T-depth
+credit-assignment problem, though not the intra-multiply one), or (c) a genuinely
+new idea for supervising the latent reduction. None are settleable on a 4-core
+CPU; the contribution of this investigation is the **exact, proven isolation** of
+what must be solved.
