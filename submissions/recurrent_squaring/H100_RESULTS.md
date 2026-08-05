@@ -78,3 +78,34 @@ modular multiplication/reduction as a generalizing function is the open frontier
 and neither throughput nor the SOTA length-gen inductive bias breaches it here.
 
 An accessible walkthrough of the task + this model: `walkthrough.html`.
+
+---
+
+## Cross-agent runs: length-general digit-register models on E5
+
+A second agent independently built the exact length-general family flagged as the
+frontier bet — on-device right-aligned **digit registers**, a **shared
+bidirectional scan** transition (length-independent), **iterative refinement**
+with temperature annealing (1.25→0.18), a **T-recurrence** trained at 4 outer
+steps but evaluated to 64 (betting on extrapolation-in-T), and a custom loss that
+**upweights T=1** (emphasis on the single-squaring rung). Two variants:
+`digit_transducer_h100` (GRU scan) and `recurrent_register_h100` (attention).
+
+| submission | dataset | score | Max T | OOD-N | notes |
+|---|---|---|---|---|---|
+| digit-register (var. A) | e5 | **0.42%** | none | none | no certification |
+| digit-register (var. B) | e5 | **0.50%** | none | none | no certification |
+| digit-register (3rd run) | e5 | **failed** | — | — | likely OOM / timeout (larger attn model) |
+
+**Update to thinking (confirms, does not overturn):** two *independent, careful*
+implementations of the length-general refinement family score ~0.4–0.5% on E5
+(variable N) with **no certification** — right where my abacus+looped attempt
+landed (1% on E3). On variable-N there is nothing to memorize, so ~0.5% is the
+honest measure of *inability to compute* modular squaring as a transferable
+function. Better engineering of this architecture family (registers, scan,
+refinement, T-extrapolation, annealing, rung upweighting) does **not** breach the
+wall. The remaining differentiated bets are the ones that change the
+**supervision** (TRM/HRM deep supervision on the observed rungs + 1-step detached
+gradients) or the **operation itself** (a structured, learned Montgomery-style
+reducer that removes the global magnitude comparison) — neither of which these
+runs used.
