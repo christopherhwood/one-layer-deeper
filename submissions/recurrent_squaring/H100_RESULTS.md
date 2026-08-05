@@ -139,3 +139,34 @@ next attempt should change the learning signal (deep supervision over recurrent
 states / short detached updates) or make modular reduction itself easier to
 learn, rather than tuning another member of either exhausted architecture
 family.
+
+---
+
+## Product-aware sequential ripple on E5
+
+The successful process-supervised ripple diagnostic could not be ported
+literally: its fixed double-and-add composition would require thousands of
+sequential cell calls at T=64 and its intermediate arithmetic labels are absent
+from the benchmark. The benchmark-compatible descendant keeps its important
+inductive biases while shortening the operation: an explicit learned embedding
+of every digit-pair product is grouped by positional significance, then a tied
+bidirectional recurrent scan learns carry, comparison, and modular reduction.
+The resulting learned square transition is tied across T. T=1 examples receive
+auxiliary endpoint losses at each refinement phase, and later square boundaries
+use truncated recurrence gradients.
+
+Before H100 submission it passed source validation, finite-gradient checks, a
+1,000-step held-out learning probe, and the complete CPU evaluator profile over
+test, OOD, and all seen/OOD depth rungs through T=64.
+
+| submission | dataset | score | Max T | OOD-N | steps/60s | notes |
+|---|---|---:|---|---|---:|---|
+| product-aware sequential ripple | e5 | **0.79%** | none | none | **1764** | test 0.9%, OOD 0.7%; best E5 result so far |
+
+**Result:** explicit product structure moved the OOD result in the right
+direction. Test accuracy matched the general scratchpad (0.9%) while OOD rose
+from 0.2% to 0.7%, and overall score improved from 0.54% to 0.79%. This is still
+far from computation: training loss settled around 2.8, exact train batches were
+almost always zero, and no depth rung certified. The remaining failure is now
+more specifically the learned reduction/normalization scan rather than forming
+the product or providing enough optimizer steps.
