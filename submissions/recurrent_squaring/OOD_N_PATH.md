@@ -40,7 +40,7 @@ arithmetic — the factorization of `N` never appears.
 | integer addition | ≤6-digit operands | **100%** at 10 and 14 digits |
 | `(a+b) mod N` | ≤4-digit `N` | **100%** at 8 and 10-digit `N` |
 | `x² mod N` (composed, **0 extra training**) | — | **100%** at N=3,4 (train) and N=6,8 (**OOD-N**) |
-| `x^(2^T) mod N` (iterate squaring) | — | exact wherever each squaring is (Claim 1): iterating an exact map stays exact |
+| `x^(2^T) mod N` (iterate squaring) | — | **100%** at T=1,2,4,8 on unseen `x`, N=5 digits |
 
 The squaring and power-tower rows use the *same* single modular-addition cell,
 wired by fixed control — nothing new is learned to go from `add` to `square` to
