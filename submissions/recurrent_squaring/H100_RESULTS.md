@@ -109,3 +109,33 @@ wall. The remaining differentiated bets are the ones that change the
 gradients) or the **operation itself** (a structured, learned Montgomery-style
 reducer that removes the global magnitude comparison) — neither of which these
 runs used.
+
+---
+
+## General recurrent scratchpad on E5
+
+The failed larger-attention run was isolated to CUDA-sensitive implementation
+risk rather than the evaluator contract. A cleaned version replaced the
+out-of-domain inactive StableMax branch with clamped branches, removed the
+custom gradient rewrite around fused AdamW, and reduced evaluation batch size
+from 1024 to 512. Before resubmission it passed compilation, official source
+validation, finite forward/backward checks, and a full CPU evaluator smoke over
+test, OOD, and every seen/OOD depth rung through T=64.
+
+| submission | dataset | score | Max T | OOD-N | steps/60s | notes |
+|---|---|---:|---|---|---:|---|
+| general recurrent scratchpad | e5 | **0.54%** | none | none | **1531** | test 0.9%, OOD 0.2%; train exact stayed 0% |
+
+**Result:** the engineering correction worked—the H100 job completed normally
+and achieved healthy throughput—but the scientific result is another failure
+to learn modular squaring. Training loss fell quickly from 5.97 to roughly 2.2,
+then plateaued for the remaining ~1400 updates; exact training accuracy was
+still zero at the end. The general-purpose weight-tied Transformer lands in the
+same ~0.4–0.5% band as the explicit digit-register family.
+
+This narrows the frontier: neither more digit structure nor removing most of
+that structure is enough under final-answer-only supervision. A differentiated
+next attempt should change the learning signal (deep supervision over recurrent
+states / short detached updates) or make modular reduction itself easier to
+learn, rather than tuning another member of either exhausted architecture
+family.
