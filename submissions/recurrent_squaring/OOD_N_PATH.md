@@ -98,3 +98,53 @@ much longer training with the H100 budget the tiers provide. The honest status:
 the exact, modulus-general **representation exists and is learnable with process
 supervision**; making it emerge from **endpoint labels alone** is the open
 problem standing between this approach and a Hard-tier result.
+
+### Hypotheses tested — and what actually broke (`crack.py`, `sum_depth.py`, `localize_endpoint_wall.py`)
+
+I ran the roadmap's leading levers as controlled experiments. Results, honestly:
+
+**Ablation on `x² mod N`, endpoint-only** (2-digit `N`):
+
+| lever | exact | verdict |
+|---|---|---|
+| #1 discrete finite-state cell | 13% | **hurt** — straight-through on a deep recurrent state is *unstable* (loss rose) |
+| #2 curriculum + transfer | 19% | marginal |
+| #1 + #2 | 0% | worse |
+
+So my leading bet (discrete state) was **refuted**. Then a controlled depth test
+(sum `M` numbers mod `N`; sequential vs. tree do the *same* number of adds, only
+the critical-path depth differs):
+
+| composition | depth | exact |
+|---|---|---|
+| one modular addition (M=2) | 1 | 45% |
+| tree (M=4 / M=8) | 2 / 3 | 3% / 4% |
+| sequential (M=8) | 7 | 3% |
+
+**Tree did not beat sequential** — depth reduction was also refuted as the lever.
+Finally, isolating each sub-operation endpoint-only pinned the real cause:
+
+| operation (in isolation, its output IS the label) | exact |
+|---|---|
+| `a+b` (carry latent) | **100%** |
+| `s−N` (borrow latent) | **100%** |
+| `s mod N` given `s` (gate latent) | **97%** |
+
+**Every atomic operation learns endpoint-only.** The wall is not the carry, the
+borrow, or the reduction — it is **composition**: when op A feeds op B and only
+B's output is labeled, A's output is a *latent intermediate* with no supervision
+and never sharpens to exact, so the composite (modular addition 45%, squaring
+65%) degrades. Carry-free / RNS representations do **not** help, because the
+latency is in the composition, not the carry.
+
+**Where this leaves it.** The true bottleneck is **multiplication**: squaring a
+many-digit number is an `O(n²)` sum of partial products, all latent under
+endpoint-only supervision — the classic reason neural nets fail at exact
+multi-digit multiply. The competition's only labels are at the `T`-rung level
+(`x^(2^T)`), which bound the squaring *boundaries* but never the arithmetic
+*inside* one squaring. Closing that gap needs process signal the data doesn't
+provide, or non-gradient methods (search / program synthesis), or scale far
+beyond a CPU. This is an honest negative result: the representation is solved and
+exact; endpoint-only learning of the internal multiply is the open wall, and the
+levers I tried (discrete state, curriculum, depth reduction, carry-free) did not
+breach it.
