@@ -142,9 +142,31 @@ many-digit number is an `O(n²)` sum of partial products, all latent under
 endpoint-only supervision — the classic reason neural nets fail at exact
 multi-digit multiply. The competition's only labels are at the `T`-rung level
 (`x^(2^T)`), which bound the squaring *boundaries* but never the arithmetic
-*inside* one squaring. Closing that gap needs process signal the data doesn't
-provide, or non-gradient methods (search / program synthesis), or scale far
-beyond a CPU. This is an honest negative result: the representation is solved and
-exact; endpoint-only learning of the internal multiply is the open wall, and the
-levers I tried (discrete state, curriculum, depth reduction, carry-free) did not
-breach it.
+*inside* one squaring.
+
+### CORRECTION — the "wall" was largely an optimization artifact (`annealed_soft_probe.py`)
+
+The negative results above shared a hidden flaw: every composed model used a
+**straight-through** hardened accumulator (`st_hard`) between steps. That
+*blocks gradient flow*, and the ~65% plateau was an **optimization** failure —
+the model could not even fit the training set (flat loss), though the
+representation is provably fittable (100% with process supervision). Two clean
+tests corrected this:
+
+1. **Second-order is *not* the fix.** Full-batch **L-BFGS** on the stuck
+   `(a+b) mod N` task did *worse* than Adam (64% vs. Adam's train-100%). So the
+   problem is not ill-conditioning per se.
+2. **Smooth differentiability *is* the fix.** Replace the straight-through
+   accumulator with a **smooth, temperature-annealed softmax** (clean gradients
+   early, sharpened toward hard/exact late). On the exact task where
+   straight-through plateaued at **65%**, and pure-soft blurred to **~10%**, the
+   annealed-soft model reaches **~95%** — the plateau breaks.
+
+So the honest picture flips: this is an **optimization / differentiability**
+problem, not a fundamental information wall. The remaining difficulty is
+**depth** in the optimization sense — direct annealed training at 2-digit `N`
+(~14 composed ops) still stalls (~10%), so it must be reached by **curriculum**
+(learn the cell where annealing works, transfer by length-independence). That
+combination is the live thread; the earlier "non-gradient methods needed"
+conclusion was **wrong** — the fix is gradient-based, and foundational to how the
+composition is made differentiable and optimized.
