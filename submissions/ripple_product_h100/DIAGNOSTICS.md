@@ -13,6 +13,8 @@ one complete modular square.
 | digit-serial quotient/correction reducer, oracle product | 0.44% | 0.25% | 0.39% | eight unsupervised reducer decisions recreate the credit-assignment wall |
 | same reducer, 8-dimensional state | 0.25% | 0.50% | 0.00% | a small-state bottleneck does not induce the reducer algorithm |
 | 32-wide ripple, strong-decay grokking run (10,000 steps) | 9.25% | 0.25% | 0.59% | model never interpolates, so no delayed generalization emerges |
+| latent-path CRF decoder, 8 states, oracle product | 63.38% | 0.50% | 1.37% | marginalization improves fitting, not identifiability |
+| latent-path CRF decoder, 16 states, oracle product | 72.00% | 0.50% | 1.17% | more latent capacity becomes a stronger memorization channel |
 
 All full-subset probes used 1,500 AdamW updates, batch size 32, seed 74, and the
 same 1,600 E5 T=1 training prompts. The oracle probes are diagnostics only; they
@@ -59,3 +61,20 @@ The next credible candidate must obtain a shorter or better-conditioned signal
 for reduction without generating prohibited arithmetic labels. Candidates that
 merely add capacity, recurrence, optimizer steps, curriculum, or stronger
 regularization have now been locally falsified.
+
+## Latent-path marginalization result
+
+`latent_crf_probe.py` replaces a single recurrent reduction trajectory with a
+conditional finite-state decoder. Forward/backward dynamic programming sums all
+latent state paths compatible with the observed remainder; no carry, quotient,
+or intermediate remainder is labeled. This materially improves optimization:
+the 8- and 16-state models fit 63% and 72% of T=1 training examples, compared
+with less than 1% for the sequential quotient/correction reducer.
+
+It does **not** improve generalization. Both state sizes remain at 0.5% on
+ordinary held-out T=1, and increasing state count only improves training fit.
+Unconstrained latent states therefore form a hidden lookup table rather than
+discovering arithmetic roles. Marginalization is useful only if the factor
+graph grounds its states in local carry/borrow/quotient relationships. Encoding
+those relationships strongly enough without crossing the benchmark's
+hard-coded-algorithm boundary is the remaining design problem.
