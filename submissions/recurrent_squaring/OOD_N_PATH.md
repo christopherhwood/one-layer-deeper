@@ -65,3 +65,36 @@ length-general arithmetic.
 Neither caveat requires factoring `N` — which is precisely why this is the route
 with a pulse on Hard, where the trapdoor is unavailable. The representation is
 exact and general (proved here); closing the training gap is the research.
+
+## The credit-assignment wall, isolated (`endpoint_only_probe.py`)
+
+I attacked caveat (1) directly: train the *same* modular-add cell and
+double-and-add squaring with **endpoint-only** supervision — only `x² mod N` is
+labeled, every carry/borrow/gate/partial-product latent (this is the honest
+competition signal: a `T=1` prompt's target is exactly `x²`). Levers tried:
+curriculum in `N`-size, a residue-faithful straight-through accumulator (exact
+forward, soft gradient), aggressive weight tying.
+
+**Result:** even at the shallowest scale (`N<10`, ~4 double-and-add steps),
+endpoint-only training **plateaus around ~65% exact** and does not reach 100%.
+Diagnosis: per-op accuracy reaches ~0.95, but ~8 latent ops compound
+(`0.95^8 ≈ 0.66`), and the diluted endpoint gradient cannot pin the *rare*
+carry/gate cases. Soft (non-straight-through) states were worse (~10%): they
+blur over depth. So the obstacle is not representation or capacity — it is
+**endpoint-only optimization of a deep, discrete latent composition**, a
+known-hard "learn an algorithm from I/O" problem.
+
+| supervision | shallow `x² mod N` exact | generalizes to OOD-N |
+|---|---|---|
+| process (intermediate) — `ood_n_arithmetic.py` | **100%** | yes |
+| endpoint-only — `endpoint_only_probe.py` | **~65% (plateau)** | no |
+
+**Roadmap for closing it** (all factoring-free, none yet decisive here):
+discrete-optimization methods beyond straight-through (Gumbel schedules,
+REINFORCE/expected-gradient on the gate); recurrence-consistency losses across
+the observed `T=1,2,3` rungs (deeper endpoint constraints, no algorithmic
+labels); an easier reduction (larger digit base → fewer, wider steps); and
+much longer training with the H100 budget the tiers provide. The honest status:
+the exact, modulus-general **representation exists and is learnable with process
+supervision**; making it emerge from **endpoint labels alone** is the open
+problem standing between this approach and a Hard-tier result.
