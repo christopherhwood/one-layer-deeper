@@ -7,7 +7,31 @@ Concurrency is **1** queued/running per account, so runs are sequential.
 |---|-----------|---------|------------------------|-------|-------------|--------------|-------|
 | 1 | recurrent_squaring | e1 | 7.17% | none | none | 195 | pooled-latent recurrent; undertrained (slow) |
 | 2 | recurrent_squaring (vectorized T-parse) | e1 | 6.17% | none | none | 153 | throughput fix did NOT help → bottleneck is elsewhere (needs GPU profiling) |
-| 3 | baseline_adamw | e1 | (pending) | — | — | — | reference anchor |
+| 3 | baseline_adamw | e1 | 1.67% | none | none | 93 | reference anchor (recurrent ≈4× baseline) |
+| 4 | recurrent_squaring (batch_size=32) | e1 | 2.33% | none | none | **1459** | 10× more steps (DataLoader fix) but score did NOT improve |
+
+## The decisive engineering + scientific finding
+
+- **DataLoader throughput bug (confirmed & fixed):** the H100 manifests use
+  `num_workers=2` with a tiny train set + large batch → ~1 batch/epoch → the
+  worker iterator is respawned almost every step (~0.6s/step overhead). Dropping
+  `batch_size` 512→32 gave **1459 vs 153 steps** (~10×). This helps *any* future
+  submission — but only if the model can actually use the steps.
+- **Throughput was NOT the score-limiter — GENERALIZATION is.** With 10× the
+  steps the score did not rise (test ≈0.05, ood 0); the extra steps just memorize
+  the tiny train set faster (train accuracy bounces, not the held-out `test`).
+  This confirms on real H100 that the pooled-latent recurrent **does not
+  generalize to fresh x** — a dead end for both Easy score and OOD-N.
+
+**Bottom line:** the gating problem is unchanged and now H100-confirmed —
+**learning modular squaring as a function that generalizes to fresh x** (bounded-N
+first, then length-general for OOD-N). Faster training doesn't create
+generalization; the architecture must. Per the "skip dead ends" directive, the
+per-residue *coverage* model (which would score high on Easy via memorized-orbit
+coverage) is intentionally **not** pursued — it can't transfer to OOD-N. The next
+build is the length-general (abacus + looped, throughput-tuned `batch_size`)
+candidate on E3/E5, as the direct H100 test of whether scale + inductive bias
+cracks the generalization frontier.
 
 ## Learnings so far
 

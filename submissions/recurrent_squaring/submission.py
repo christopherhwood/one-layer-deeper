@@ -230,5 +230,5 @@ def build_optimizer(model: nn.Module, spec: OptimizerSpec) -> OptimizerBundle:
 SUBMISSION = Submission(
     build_model=build_model,
     build_optimizer=build_optimizer,
-    batch_size=512,
+    batch_size=32,
 )
