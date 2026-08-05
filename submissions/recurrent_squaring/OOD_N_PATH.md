@@ -239,8 +239,32 @@ model (W=3), so it is *not* length-general and cannot itself scale to larger `N`
 (unlike the digit-ripple cell); its 97% is fit/generalization *within* 2-digit
 `N`, not OOD-N. (2) The domain is small enough that some memorization is possible.
 So the result validates the **principle** (pass-through cures the deep-training
-stall), not a finished OOD-N solution. The indicated build: carry a **residual
-hidden state across the composition** while keeping the **length-general
-digit-ripple** structure for the per-step arithmetic — combining Proof-1/2's
-"good cell composes" with the highway that lets a good cell actually be trained
-through depth.
+stall), not a finished OOD-N solution.
+
+### What blocks OOD-N, and the mis-step that sharpened the attack (`oodn_neural_gpu.py`)
+
+Three things block OOD-N: (1) **fixed width** (a wider `N` has no input slots);
+(2) a **global blob state** memorizes width-specifically instead of learning a
+length-independent procedure; (3) **exactness compounds** — a larger `N` needs a
+deeper composition, so the per-step cell must be ~100%, not 97% (95%⁶⁴ ≈ 4%).
+
+The natural attack — combine a length-general **tied convolution** (Neural-GPU
+style) with the residual highway — was tested (train on 1–3 digit `N`, eval 5–6
+digit): **train ~60%, OOD-5d/6d = 0%.** It does *not* length-generalize. The
+reason is specific and useful: **modular reduction needs a GLOBAL magnitude
+comparison** (`is running-value ≥ N?` across *all* digits), and a local conv
+cannot carry that comparison in a length-independent way.
+
+But we already have a length-general structure that *does* generalize OOD for
+modular arithmetic: the **sequential borrow-propagating digit-ripple** (§`arith_2`
+earlier), which reached **100% on 8–10-digit `N` trained only on ≤4-digit** —
+because the borrow chain *is* the global comparison, propagated LSB→MSB. So the
+right length-general per-step cell is the **sequential ripple, not the conv.**
+
+**Refined attack (well-motivated, not yet built):** sequential borrow-ripple cell
+(length-general, proven to generalize OOD for one modular op) **+** a residual
+highway *across the composition* (the Proof-2 fix that lets a good cell survive
+deep endpoint-only training). Blocker 3 is then handled because a finite-state
+ripple learned to *exactly* 100% (add/sub already do) composes without decay. The
+conv detour shows the highway alone is not enough — the length-general substrate
+must be the one that can do the global mod-comparison.
