@@ -8,3 +8,4 @@ data/generated
 .codex
 user_subs
 scratchpad
+*-metrics.jsonl
