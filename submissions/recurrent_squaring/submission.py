@@ -137,50 +137,33 @@ class Model(nn.Module):
         )
         self.head = nn.Linear(D_MODEL, spec.vocab_size, bias=False)
 
-    def _read_time_steps(self, input_ids: Tensor) -> int:
-        """Recurrence depth = max T in the batch (adaptive computation, rule 4).
+    def _time_steps(self, input_ids: Tensor) -> tuple[Tensor, int]:
+        """Per-row recurrence depth T, fully vectorized (adaptive computation,
+        rule 4). T is the decimal digits after the T marker; it only sets how
+        many times the learned cell is applied and never enters the logits.
 
-        T is encoded as the decimal digits after the T marker.  This only sets
-        how many times the learned cell is applied; it never enters the logits.
-        """
-        max_t = 1
-        ids = input_ids.tolist()
-        for row in ids:
-            digits, reading = [], False
-            for tok in row:
-                if tok == T_MARK:
-                    reading = True
-                    continue
-                if reading:
-                    if DIGIT_OFFSET <= tok < DIGIT_OFFSET + 10:
-                        digits.append(tok - DIGIT_OFFSET)
-                    else:
-                        break
-            if digits:
-                value = 0
-                for d in digits:
-                    value = value * 10 + d
-                max_t = max(max_t, value)
-        return max(1, min(MAX_ITERS, max_t))
-
-    def _row_time_steps(self, input_ids: Tensor) -> Tensor:
-        out = []
-        for row in input_ids.tolist():
-            digits, reading = [], False
-            for tok in row:
-                if tok == T_MARK:
-                    reading = True
-                    continue
-                if reading:
-                    if DIGIT_OFFSET <= tok < DIGIT_OFFSET + 10:
-                        digits.append(tok - DIGIT_OFFSET)
-                    else:
-                        break
-            value = 0
-            for d in digits:
-                value = value * 10 + d
-            out.append(max(1, min(MAX_ITERS, value if digits else 1)))
-        return torch.tensor(out, device=input_ids.device, dtype=torch.long)
+        The only loop is over sequence length (~12), never the batch, so this is
+        O(L) tensor ops regardless of batch size — avoiding a Python throughput
+        bottleneck."""
+        batch, length = input_ids.shape
+        device = input_ids.device
+        idx = torch.arange(length, device=device)
+        is_mark = input_ids == T_MARK
+        # last T-marker position per row (-1 if none)
+        marker_pos = torch.where(
+            is_mark, idx.unsqueeze(0), torch.full_like(input_ids, -1)
+        ).max(dim=1).values
+        after = idx.unsqueeze(0) > marker_pos.unsqueeze(1)
+        is_digit = (input_ids >= DIGIT_OFFSET) & (input_ids < DIGIT_OFFSET + 10)
+        digit_mask = (after & is_digit).long()
+        digit_val = (input_ids - DIGIT_OFFSET).clamp(0, 9)
+        # Horner over positions: value = value*10 + digit where digit_mask, else value
+        value = torch.zeros(batch, dtype=torch.long, device=device)
+        for i in range(length):
+            m = digit_mask[:, i]
+            value = value * (1 + 9 * m) + digit_val[:, i] * m
+        row_t = value.clamp(min=1, max=MAX_ITERS)
+        return row_t, int(row_t.max().item())
 
     def forward(
         self,
@@ -207,8 +190,7 @@ class Model(nn.Module):
         # each row's state is frozen once its own T is reached (equivalent to
         # per-row depth = T, but batched).  Gradient flows through every used
         # application of the shared cell.
-        steps = self._read_time_steps(input_ids)
-        row_t = self._row_time_steps(input_ids)
+        row_t, steps = self._time_steps(input_ids)
         for i in range(1, steps + 1):
             z_next = self.cell(z)
             active = (row_t >= i).float().unsqueeze(-1)
