@@ -167,28 +167,51 @@ problem, not a fundamental information wall. The earlier "non-gradient methods
 needed" conclusion was **wrong** — the fix is gradient-based and foundational to
 how the composition is made differentiable and optimized.
 
-The remaining difficulty is **depth in the optimization sense**: a *soft*
-composition **blurs** as it deepens, so the annealed model cracks shallow
-squaring (N<10: ~95%) but stalls deeper —
+The remaining difficulty is **depth in the optimization sense** — and I first
+mis-explained it as "blur." Two proofs settle what actually fails.
 
-| endpoint-only squaring, annealed-soft | exact |
-|---|---|
-| N<10 (~8 composed ops) | **~95%** |
-| 2-digit N direct (~14 ops) | ~10% |
-| 2-digit N via 1-digit→2-digit curriculum | **~24%** (train), 0% OOD |
+**Proof 1 — it is NOT forward blur (`proof_no_blur.py`).** Train one
+`(a+b) mod N` cell to 95% single-op accuracy, **freeze** it, and compose it K
+times (repeated doubling, exact ground truth `2^K·x mod N`):
 
-Curriculum helps (0→24%) but does not carry: 1-digit numbers never exercise
-multi-digit carries, and 7+ soft-composed steps blur past what annealing at a
-stable floor (`tau≈0.2`) removes. So there are **two** distinct levers, and both
-are needed together:
+| K | hard-compose exact | soft-compose exact | soft accumulator peak-prob |
+|---|---|---|---|
+| 1 | 94.7% | 94.7% | 0.998 |
+| 4 | 87.3% | 87.3% | 0.999 |
+| 8 | 81.5% | 81.2% | 0.997 |
+| 12 | 78.0% | 77.2% | 0.998 |
 
-1. **smooth + annealed** — fixes the *gradient* (proven: 65%→95% shallow);
-2. **minimal composition depth** — fixes the *blur*, e.g. a quadratic-form
-   squaring `x² = Σ xᵢxⱼ·(base^{i+j} mod N)` reduced by a **tree** (depth ~log)
-   instead of bit-serial double-and-add (depth ~bits), and/or a **wider digit
-   base** (fewer positions). The earlier tree test failed only because it used
-   straight-through; combined with annealed-soft it is the untested-but-indicated
-   next step.
+Hard ≈ soft at every depth and peak-prob stays ~1.0 — **no blur.** A *good* cell
+composes fine; the gentle decay is just an imperfect (95%, not 100%) cell
+compounding. So the soft representation was never the problem.
 
-Status: the shallow case is essentially solved end-to-end; scaling to Hard-sized
-`N` hinges on the minimal-depth architecture so the soft composition stays sharp.
+**Proof 2 — deep END-TO-END training fails to teach the cell
+(`proof_depth_kills_cell.py`).** Train the doubling task endpoint-only at depth K
+(supervise only `2^K·x mod N`), then measure the learned cell's *single-step*
+accuracy:
+
+| train-depth K | endpoint exact | learned cell single-step exact |
+|---|---|---|
+| 1 | **100%** | **100%** |
+| 4 | 10.8% | **10.0%** |
+| 8 | 7.0% | **6.2%** |
+
+This is the real failure, proven: **the deeper the composition you back-prop
+through, the worse the shared cell you can learn** — its single-step competence
+collapses from 100% (direct supervision) to ~6% (through 8 tied steps). The
+gradient from a distant endpoint, routed through many tied composition steps,
+cannot teach the cell the operation. Not blur, not representational capacity —
+**credit assignment / optimization through depth.**
+
+Together the two proofs give the recipe: a good cell composes (Proof 1), so the
+whole game is *getting* a good cell, which needs **shallow** (ideally single-step)
+supervision of the cell (Proof 2). The competition supplies only `T`-rung
+endpoints, and one squaring is itself deep (bit-serial double-and-add) — so the
+indicated fix is a **minimal-depth squaring** (quadratic-form `x² = Σ
+xᵢxⱼ·(base^{i+j} mod N)` reduced by a tree; wider digit base) so the rung-level
+label supervises a near-shallow composition. Curriculum is the same idea in the
+training schedule; the 1→2-digit version only reached ~24% because 1-digit inputs
+never exercise the multi-digit carries the deep case needs.
+
+Status: shallow is solved end-to-end (~95%); scaling to Hard-sized `N` hinges on
+delivering shallow-enough supervision to the cell, per the two proofs above.
