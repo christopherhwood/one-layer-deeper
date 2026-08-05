@@ -215,3 +215,32 @@ never exercise the multi-digit carries the deep case needs.
 
 Status: shallow is solved end-to-end (~95%); scaling to Hard-sized `N` hinges on
 delivering shallow-enough supervision to the cell, per the two proofs above.
+
+### A residual / pass-through highway breaks the deep-training stall (`passthrough_residual.py`)
+
+Proof 2 said the failure is optimization *through depth*. The standard cure for
+that in deep nets is a **residual / pass-through gradient highway** (ResNet,
+highway nets, LSTM cell-state, and the "iterative refinement / TRM" designs the
+rules mention). Tested on the exact failing case — learn `(2^K x) mod N`
+endpoint-only through K=8 tied steps:
+
+| update rule | endpoint-exact |
+|---|---|
+| plain `h ← cell(h,N)` | 61.5% (stalls early ~8–10%, slow) |
+| **residual `h ← h + cell(h,N)`** (cell zero-init → starts as identity) | **97.0%** (fast, loss→0.04) |
+
+The highway helps for two compounding reasons: the additive path is a **gradient
+highway** to early steps, and identity-init means early untrained steps emit
+**valid intermediates**, not garbage — directly countering the failure mode of
+Proof 2. This is the first lever that clearly moves the deep endpoint-only case.
+
+**Honest caveats.** (1) This proof-of-principle uses a fixed-width hidden-state
+model (W=3), so it is *not* length-general and cannot itself scale to larger `N`
+(unlike the digit-ripple cell); its 97% is fit/generalization *within* 2-digit
+`N`, not OOD-N. (2) The domain is small enough that some memorization is possible.
+So the result validates the **principle** (pass-through cures the deep-training
+stall), not a finished OOD-N solution. The indicated build: carry a **residual
+hidden state across the composition** while keeping the **length-general
+digit-ripple** structure for the per-step arithmetic — combining Proof-1/2's
+"good cell composes" with the highway that lets a good cell actually be trained
+through depth.
