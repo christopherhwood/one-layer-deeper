@@ -163,10 +163,32 @@ tests corrected this:
    annealed-soft model reaches **~95%** — the plateau breaks.
 
 So the honest picture flips: this is an **optimization / differentiability**
-problem, not a fundamental information wall. The remaining difficulty is
-**depth** in the optimization sense — direct annealed training at 2-digit `N`
-(~14 composed ops) still stalls (~10%), so it must be reached by **curriculum**
-(learn the cell where annealing works, transfer by length-independence). That
-combination is the live thread; the earlier "non-gradient methods needed"
-conclusion was **wrong** — the fix is gradient-based, and foundational to how the
-composition is made differentiable and optimized.
+problem, not a fundamental information wall. The earlier "non-gradient methods
+needed" conclusion was **wrong** — the fix is gradient-based and foundational to
+how the composition is made differentiable and optimized.
+
+The remaining difficulty is **depth in the optimization sense**: a *soft*
+composition **blurs** as it deepens, so the annealed model cracks shallow
+squaring (N<10: ~95%) but stalls deeper —
+
+| endpoint-only squaring, annealed-soft | exact |
+|---|---|
+| N<10 (~8 composed ops) | **~95%** |
+| 2-digit N direct (~14 ops) | ~10% |
+| 2-digit N via 1-digit→2-digit curriculum | **~24%** (train), 0% OOD |
+
+Curriculum helps (0→24%) but does not carry: 1-digit numbers never exercise
+multi-digit carries, and 7+ soft-composed steps blur past what annealing at a
+stable floor (`tau≈0.2`) removes. So there are **two** distinct levers, and both
+are needed together:
+
+1. **smooth + annealed** — fixes the *gradient* (proven: 65%→95% shallow);
+2. **minimal composition depth** — fixes the *blur*, e.g. a quadratic-form
+   squaring `x² = Σ xᵢxⱼ·(base^{i+j} mod N)` reduced by a **tree** (depth ~log)
+   instead of bit-serial double-and-add (depth ~bits), and/or a **wider digit
+   base** (fewer positions). The earlier tree test failed only because it used
+   straight-through; combined with annealed-soft it is the untested-but-indicated
+   next step.
+
+Status: the shallow case is essentially solved end-to-end; scaling to Hard-sized
+`N` hinges on the minimal-depth architecture so the soft composition stays sharp.
