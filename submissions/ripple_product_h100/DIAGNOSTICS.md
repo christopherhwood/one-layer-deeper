@@ -120,3 +120,41 @@ reuse a local subtract/compare cell as a recurrent or monotone quotient search,
 while finding a rules-valid shallow or consistency signal that fixes the cell's
 semantics. These probes fail the local learning gate, so they do not justify a
 new H100 submission.
+
+## Proposer-free monotone quotient result
+
+`monotone_quotient_probe.py` removes global quotient prediction. It enumerates
+ordered candidates and defines `q` as the boundary where `P-qN` changes from
+nonnegative to negative. Training adds endpoint anchors, a monotonicity penalty,
+annealed boundary selection, and a copy/residual route through the local FST.
+No quotient or borrow labels are used in the endpoint-only modes.
+
+Reusing the subtractor's marginalized terminal state as the comparison signal
+does not work. The boundary sharpens late in training but converges to the wrong
+semantics: held-out quotient and remainder accuracy are both 0.25%. Even when
+the quotient is exposed to a diagnostic control loss, the subtractor learns
+(73.0% held-out remainder with the true quotient) while terminal-state boundary
+selection remains random (0.5%). A state sufficient to generate output digits
+is therefore not automatically a useful magnitude comparator.
+
+Giving comparison its own tied MSD-first GRU improves optimization but not
+endpoint identifiability:
+
+| monotone selector | train remainder / q | held-out remainder / q | adversarial remainder / q |
+|---|---:|---:|---:|
+| endpoint-only explicit comparator | 0.75% / 0.00% | 0.25% / 0.00% | 0.00% / 0.20% |
+| oracle-quotient control | **42.25% / 55.25%** | **37.75% / 55.00%** | **40.23% / 52.73%** |
+
+In the oracle control, decoding with the true quotient reaches 77.56% train,
+71.00% held-out, and 75.98% adversarial exact accuracy. This demonstrates that
+the proposer-free local factorization can learn reusable subtraction and
+comparison when their semantics are named. Endpoint-only training instead lets
+the two modules coordinate on an arbitrary sharp threshold.
+
+The experiment rules out three increasingly grounded forms of endpoint
+marginalization: unconstrained latent paths, quotient strings with a local
+decoder, and ordered quotient search with an explicit comparator. More
+arithmetic topology alone is not the missing lever. A further attempt should
+change the source of the learning signal (for example, a genuinely
+general-purpose consistency/pretraining objective or better amortized latent
+inference), while retaining the local factorization only as an inductive bias.
