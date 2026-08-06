@@ -263,3 +263,17 @@ The surviving architectural signal is modest: tied attention repeatedly raises
 seen-N T=1 to 12/512, and removing absolute position can raise short OOD-N from
 one success to three. Neither occurs together at the full gate. These results
 do not meet the 5% seen / 3% OOD-N H100 gate and should not consume an H100 run.
+
+## Hosted Easy/E5 override
+
+The CPU gate was later explicitly overridden while testing endpoint-clamped
+finite-state learning. Submission `ca9d15ca-1499-47e7-845f-1c7552f80ff5`
+completed 942 H100 updates in 60 seconds. Final training exact was 9.4%; test
+exact was 1.1%, OOD exact was 1.3%, and the hosted split-mean score was
+**1.21%**. No seen or OOD-N T=1 rung certified.
+
+This exceeds the previous 1.13% product-attention record. More importantly, it
+is the first hosted confirmation that exact endpoint normalization over
+observable digit states improves the frontier without relying on hidden
+arithmetic traces. It is the new Easy/E5 score control for program-lattice
+work.

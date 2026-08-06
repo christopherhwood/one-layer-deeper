@@ -56,6 +56,8 @@ few answers by chance.
 | grounded program, vectorized controller | 336 | 0.8% | 0.7% | 1.3% | 1.00% |
 | grounded program, fast batch 128 | 300 | 0.0% | 0.6% | 1.0% | 0.79% |
 | grounded program, fast batch 512 | 244 | 0.4% | 0.7% | 0.8% | 0.75% |
+| observable-digit output CRF | 942 | 9.4% | 1.1% | 1.3% | **1.21%** |
+| endpoint program-depth lattice | 1,087 | 28.1% | 0.6% | 1.5% | 1.04% |
 
 No candidate certifies seen or OOD-N T=1.  The H100 runs separate three failure
 modes: general cellular recurrence cannot fit the variable task despite healthy
@@ -116,3 +118,12 @@ On H100, vectorizing all controller alternatives reaches 1.00%; simplifying the
 cell and raising batch size from 128 to 512 increases processed examples from
 38,400 to 124,928 but scores only 0.75%. The failure therefore persists after a
 3.25x data-throughput gain and is not explained by accelerator starvation.
+
+Exact marginalization over a globally shared 1--4 refinement-depth version
+space raises fixed exact to 30.17% and hosted training exact to 28.1%, but its
+H100 score is only 1.04%. The matched observable-digit CRF scores a new record
+of 1.21% while fitting less. This isolates the positive theorem's remaining
+premise: endpoint likelihood can train the version space, but the available
+examples do not distinguish stopping depth as the reusable program. The next
+lattice must expose causally necessary tape operations and retain posterior
+uncertainty until the data actually eliminate alternatives.
