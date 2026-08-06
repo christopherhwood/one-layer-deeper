@@ -112,6 +112,15 @@ budget.
 
 ### Current rule-7 boundary
 
+> **Do not submit this candidate to private Hard as rules-valid.** The public
+> clarification “Obvs no hard coding the algorithm into the forward” resolves
+> the ambiguity below against this design. Although the categorical switches
+> are randomly initialized and endpoint-trained, Python still fixes the
+> add/reduce/double-and-add interpreter and repeats the resulting square-shaped
+> cell. Learning implementation switches inside a supplied arithmetic algorithm
+> is not the same as learning the algorithm. The hidden recurrence warning also
+> makes this an unsafe scoring assumption independently of admissibility.
+
 Learned from endpoints:
 
 - the two local finite-state relation coefficients;

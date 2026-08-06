@@ -1,5 +1,21 @@
 # General recurrent model with sequence-value loss
 
+## Horizon-local direct-feedback follow-up (2026-08-06)
+
+To respect the clarified rule-7 boundary, the follow-up contains no product
+features, modular operations, carry/reduction structure, or arithmetic program
+interpreter. It retains the original `x` as immutable generic prompt context and
+uses fixed random feedback projections to expose the supplied endpoint error to
+all six inner refinements at every outer horizon through T=8.
+
+The ten-second fixed smoke reached 7.17% mean exact in 131 updates, slightly
+above the prior value-loss smoke's 6.67% in 358 updates. The matched 60-second
+variable-modulus E5 gate rejected it: 367 updates, 0.33% ordinary mean exact,
+15.14% token accuracy, 0.20% seen-N T=1 exact, and 0.39% OOD-N T=1 exact. It
+certified no rung and underperformed the original value-loss candidate's 0.71%
+ordinary mean exact. Direct horizon feedback improves small-task sample
+efficiency but still does not identify a reusable variable-modulus transition.
+
 This candidate keeps the deeply supervised, weight-tied general recurrent
 architecture and adds one dense endpoint signal. For every row, the loss turns
 the model's digit probabilities into a normalized soft decimal value,

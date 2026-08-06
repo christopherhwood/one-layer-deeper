@@ -1,7 +1,7 @@
-"""Length-scaled gated convolutional reasoner for repeated composition.
+"""Length-scaled gated convolutional reasoner for hidden recurrence.
 
-The learned transition is a small Neural-GPU-style cellular state machine.  A
-digit register and immutable context are projected into one cell per digit;
+The learned transition is a small Neural-GPU-style cellular state machine. A
+digit register and all immutable prompt context are projected into one cell per digit;
 the same local gated update is then applied a number of times proportional to
 the register length.  Nothing in the update encodes multiplication, carries,
 comparison, or modular reduction.  The transition is reused unchanged for
@@ -36,6 +36,8 @@ DIGIT_OFFSET = 7
 NUM_DIGITS = 10
 HIDDEN = 128
 SWEEPS = 2
+TRAIN_OUTER_STEPS = 8
+CRF_STEPS = 2
 MAX_OUTER_STEPS = 64
 BASE_LR = 2.0e-3
 
@@ -89,14 +91,30 @@ class CellularTransition(nn.Module):
         self.modulus_projection = nn.Linear(NUM_DIGITS, HIDDEN, bias=False)
         self.boundary_projection = nn.Linear(2, HIDDEN, bias=False)
         self.input_norm = RMSNorm(HIDDEN)
-        self.input_mix = nn.Linear(3 * HIDDEN, HIDDEN, bias=False)
+        self.original_projection = nn.Linear(NUM_DIGITS, HIDDEN, bias=False)
+        self.input_mix = nn.Linear(4 * HIDDEN, HIDDEN, bias=False)
         self.seed = nn.Parameter(torch.empty(1, 1, HIDDEN))
         self.cell = CellularUpdate()
         self.output_norm = RMSNorm(HIDDEN)
         self.output = nn.Linear(HIDDEN, NUM_DIGITS)
         self.feedback = nn.Linear(NUM_DIGITS, HIDDEN, bias=False)
         self.feedback_gate = nn.Parameter(torch.full((HIDDEN,), -1.5))
+        self.crf_transition = nn.Parameter(torch.empty(NUM_DIGITS, NUM_DIGITS))
+        self.crf_scale = nn.Parameter(torch.tensor(-1.0))
         nn.init.normal_(self.seed, std=HIDDEN**-0.5)
+        nn.init.normal_(self.crf_transition, std=0.02)
+
+    def _refine_digits(self, unary: Tensor) -> Tensor:
+        logits = unary
+        scale = torch.sigmoid(self.crf_scale)
+        for _ in range(CRF_STEPS):
+            probability = F.softmax(logits, dim=-1)
+            left_probability = F.pad(probability[:, :-1], (0, 0, 1, 0))
+            right_probability = F.pad(probability[:, 1:], (0, 0, 0, 1))
+            left_message = left_probability @ self.crf_transition
+            right_message = right_probability @ self.crf_transition.transpose(0, 1)
+            logits = unary + scale * (left_message + right_message)
+        return logits
 
     def _boundaries(self, reference: Tensor) -> Tensor:
         boundary = torch.zeros(
@@ -110,10 +128,12 @@ class CellularTransition(nn.Module):
         self,
         source: Tensor,
         modulus: Tensor,
+        original: Tensor,
         temperature: float,
     ) -> tuple[Tensor, tuple[Tensor, ...]]:
         source_features = self.source_projection(source)
         modulus_features = self.modulus_projection(modulus)
+        original_features = self.original_projection(original)
         boundary_features = self._boundaries(source)
         context = self.input_norm(
             self.input_mix(
@@ -121,6 +141,7 @@ class CellularTransition(nn.Module):
                     (
                         source_features,
                         modulus_features,
+                        original_features,
                         boundary_features.expand(source.shape[0], -1, -1),
                     ),
                     dim=-1,
@@ -132,7 +153,7 @@ class CellularTransition(nn.Module):
         for _ in range(SWEEPS):
             for _ in range(self.digits):
                 state = self.cell(state, context)
-            logits = self.output(self.output_norm(state))
+            logits = self._refine_digits(self.output(self.output_norm(state)))
             phase_logits.append(logits)
             probabilities = F.softmax(logits / temperature, dim=-1)
             state = state + torch.sigmoid(self.feedback_gate) * self.feedback(
@@ -248,8 +269,11 @@ class Model(nn.Module):
             attention_mask = input_ids != PAD
         valid = attention_mask.bool()
         modulus, register, t_values = self._parse(input_ids, valid)
+        original = register
         outer_steps = (
-            3 if self.training else int(t_values.max().item())
+            min(TRAIN_OUTER_STEPS, int(t_values.max().item()))
+            if self.training
+            else int(t_values.max().item())
         )
         temperature = (
             self.training_temperature if self.training else self.eval_temperature
@@ -265,7 +289,14 @@ class Model(nn.Module):
             for _ in range(SWEEPS)
         ]
         for outer_step in range(outer_steps):
-            candidate, phases = self.transition(register, modulus, temperature)
+            source = (
+                register.detach()
+                if self.training and outer_step > 0
+                else register
+            )
+            candidate, phases = self.transition(
+                source, modulus, original, temperature
+            )
             terminal = (t_values == outer_step + 1)[:, None, None]
             terminal_phases = [
                 torch.where(terminal, phase, previous)

@@ -1,9 +1,11 @@
-"""General recurrent endpoint learner with a dense numeric value loss.
+"""Generic recurrent learner with horizon-local direct feedback.
 
-The architecture remains a tied attention transition over generic answer and
-scratch slots.  Its additional training signal converts only evaluator-supplied
-endpoint digit labels and learned output probabilities into normalized decimal
-values.  It introduces no solver, arithmetic rollout, or process labels.
+One learned token-mixing transition is tied across inner refinement and outer
+recurrence depth. It sees canonical decimal registers for the current state,
+the immutable prompt fields, and generic position features. During training,
+fixed randomly initialized feedback heads expose the evaluator's endpoint error
+to every refinement at every outer horizon. No arithmetic features, operations,
+transition rules, or generated process labels appear in the forward pass.
 """
 
 from __future__ import annotations
@@ -36,7 +38,9 @@ HEADS = 4
 SEGMENTS = 6
 MICRO_STEPS = 1
 MAX_OUTER_STEPS = 64
+TRAIN_OUTER_STEPS = 8
 BASE_LR = 1.0e-3
+LOCAL_FEEDBACK_WEIGHT = 0.35
 
 
 class Config:
@@ -92,12 +96,19 @@ class DeepRecurrentTransition(nn.Module):
         self.digits = digits
         self.digit_projection = nn.Linear(NUM_DIGITS, WIDTH, bias=False)
         self.position_projection = nn.Linear(2, WIDTH, bias=False)
-        self.role_embedding = nn.Parameter(torch.empty(4, WIDTH))
+        self.role_embedding = nn.Parameter(torch.empty(5, WIDTH))
         self.answer_seed = nn.Parameter(torch.empty(digits, WIDTH))
         self.scratch_seed = nn.Parameter(torch.empty(digits, WIDTH))
         self.block = ReasoningBlock()
         self.output_norm = RMSNorm(WIDTH)
         self.output = nn.Linear(WIDTH, NUM_DIGITS)
+        self.horizon_projection = nn.Linear(3, WIDTH, bias=False)
+        self.feedback_norm = RMSNorm(WIDTH)
+        self.register_buffer(
+            "fixed_feedback",
+            torch.randn(NUM_DIGITS, WIDTH) / math.sqrt(WIDTH),
+            persistent=True,
+        )
         self.snap_gate = nn.Parameter(torch.full((WIDTH,), -1.0))
         nn.init.normal_(self.role_embedding, std=WIDTH**-0.5)
         nn.init.normal_(self.answer_seed, std=WIDTH**-0.5)
@@ -111,9 +122,11 @@ class DeepRecurrentTransition(nn.Module):
         self,
         source: Tensor,
         modulus: Tensor,
+        original: Tensor,
+        remaining_steps: Tensor,
         temperature: float,
         detach_segments: bool,
-    ) -> tuple[Tensor, tuple[Tensor, ...]]:
+    ) -> tuple[Tensor, tuple[Tensor, ...], tuple[Tensor, ...]]:
         batch = source.shape[0]
         position = self._positions(source.device, source.dtype)
         modulus_context = (
@@ -126,7 +139,14 @@ class DeepRecurrentTransition(nn.Module):
             + position
             + self.role_embedding[1]
         )
-        context = torch.cat((modulus_context, source_context), dim=1)
+        original_context = (
+            self.digit_projection(original)
+            + position
+            + self.role_embedding[4]
+        )
+        context = torch.cat(
+            (modulus_context, source_context, original_context), dim=1
+        )
         answer = (
             self.answer_seed
             + self.digit_projection(source)
@@ -138,13 +158,29 @@ class DeepRecurrentTransition(nn.Module):
         ).unsqueeze(0).expand(batch, -1, -1)
 
         phase_logits: list[Tensor] = []
+        feedback_logits: list[Tensor] = []
+        remaining = remaining_steps.to(source.dtype)
+        horizon_features = torch.stack(
+            (
+                remaining / MAX_OUTER_STEPS,
+                torch.log1p(remaining) / math.log1p(MAX_OUTER_STEPS),
+                1.0 / (1.0 + remaining),
+            ),
+            dim=-1,
+        )
+        horizon = self.horizon_projection(horizon_features)[:, None]
         for segment in range(SEGMENTS):
             for _ in range(MICRO_STEPS):
                 state = self.block(torch.cat((context, answer, scratch), dim=1))
-                answer = state[:, 2 * self.digits : 3 * self.digits]
-                scratch = state[:, 3 * self.digits :]
+                answer = state[:, 3 * self.digits : 4 * self.digits]
+                scratch = state[:, 4 * self.digits :]
             logits = self.output(self.output_norm(answer))
             phase_logits.append(logits)
+            feedback_logits.append(
+                F.linear(
+                    self.feedback_norm(answer + horizon), self.fixed_feedback
+                )
+            )
             probabilities = F.softmax(logits / temperature, dim=-1)
             snapped = (
                 self.digit_projection(probabilities)
@@ -156,7 +192,7 @@ class DeepRecurrentTransition(nn.Module):
             if detach_segments and segment + 1 < SEGMENTS:
                 answer = answer.detach()
                 scratch = scratch.detach()
-        return probabilities, tuple(phase_logits)
+        return probabilities, tuple(phase_logits), tuple(feedback_logits)
 
 
 class Model(nn.Module):
@@ -168,7 +204,7 @@ class Model(nn.Module):
         self.max_length = spec.max_seq_len
         self.digits = max(2, (spec.max_seq_len - 5) // 2)
         self.transition = DeepRecurrentTransition(self.digits)
-        self.training_outer_steps = 3
+        self.training_outer_steps = TRAIN_OUTER_STEPS
         self.training_temperature = 1.0
         self.eval_temperature = 0.10
         self.detach_segments = True
@@ -257,6 +293,7 @@ class Model(nn.Module):
             attention_mask = input_ids != PAD
         valid = attention_mask.bool()
         modulus, register, t_values = self._parse(input_ids, valid)
+        original = register
         outer_steps = self.training_outer_steps if self.training else MAX_OUTER_STEPS
         temperature = self.training_temperature if self.training else self.eval_temperature
         terminal_phases: list[Tensor] = [
@@ -266,10 +303,18 @@ class Model(nn.Module):
             )
             for _ in range(SEGMENTS)
         ]
+        local_feedback: list[Tensor] = []
+        local_feedback_masks: list[Tensor] = []
         for outer_step in range(outer_steps):
             source = register.detach() if self.training and outer_step > 0 else register
-            candidate, phases = self.transition(
-                source, modulus, temperature, self.training and self.detach_segments
+            remaining = (t_values - outer_step - 1).clamp_min(0)
+            candidate, phases, feedback = self.transition(
+                source,
+                modulus,
+                original,
+                remaining,
+                temperature,
+                self.training and self.detach_segments,
             )
             terminal = (t_values == outer_step + 1)[:, None, None]
             terminal_phases = [
@@ -278,13 +323,26 @@ class Model(nn.Module):
             ]
             active = (t_values > outer_step)[:, None, None]
             register = torch.where(active, candidate, register)
+            if self.training:
+                local_feedback.extend(feedback)
+                local_feedback_masks.extend(
+                    [active[:, 0, 0]] * len(feedback)
+                )
 
         lengths = valid.sum(dim=1)
         logits = self._place_logits(register.clamp_min(1e-8).log(), lengths, prompt)
         phase_logits = tuple(
             self._place_logits(phase, lengths, prompt) for phase in terminal_phases
         )
-        return logits, {"t_values": t_values, "phase_logits": phase_logits}
+        feedback_logits = tuple(
+            self._place_logits(item, lengths, prompt) for item in local_feedback
+        )
+        return logits, {
+            "t_values": t_values,
+            "phase_logits": phase_logits,
+            "feedback_logits": feedback_logits,
+            "feedback_masks": tuple(local_feedback_masks),
+        }
 
 
 def _target_aligned(full_logits: Tensor, batch: TokenLossBatch) -> Tensor:
@@ -346,7 +404,29 @@ def token_training_loss(batch: TokenLossBatch) -> Tensor:
         for phase in phases
     ]
     value = _sequence_value_loss(batch)
-    return endpoint + 0.5 * torch.stack(deep_terms).mean() + value
+    feedback_terms = [
+        _masked_cross_entropy(
+            _target_aligned(logits, batch),
+            batch.labels,
+            batch.valid_mask & mask[:, None],
+        )
+        for logits, mask in zip(
+            batch.auxiliary["feedback_logits"],
+            batch.auxiliary["feedback_masks"],
+            strict=True,
+        )
+    ]
+    local = (
+        torch.stack(feedback_terms).mean()
+        if feedback_terms
+        else endpoint.new_zeros(())
+    )
+    return (
+        endpoint
+        + 0.5 * torch.stack(deep_terms).mean()
+        + value
+        + LOCAL_FEEDBACK_WEIGHT * local
+    )
 
 
 class WallClockSchedule:
