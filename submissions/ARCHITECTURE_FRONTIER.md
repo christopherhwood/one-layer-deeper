@@ -30,6 +30,7 @@ few answers by chance.
 | position-only product mixer | content-independent relative routing | 0.29% | 15.06% | 10.75% | 16.07% | 60s OOD signal; H100 explore |
 | position-routed content gate | fixed routing + multiplicative local update | 0.38% | 14.99% | 9.42% | 16.07% | 60s rejected |
 | reversible product reducer | additive coupling inner recurrence | 0.42% | 14.98% | 9.79% | 17.18% | sample-efficient smoke; 60s rejected |
+| position-only + paired state recovery | fitted scratch perturbation + clean trajectory targets | 0.46% | 15.10% | 9.00% | 16.38% | better exact/efficiency; 60s OOD rejected |
 | Fourier numeric operator | learned periodic scalar basis | failed fixed smoke | — | — | — | reject |
 | untied Transformer | specialized depth/full gradients | failed fixed smoke | — | — | — | reject |
 
@@ -59,6 +60,9 @@ submission rules do not permit participants to create.
    applied to the same endpoint gradient.
 3. A rules-audited way to exploit the observed `T=1/2/3` square boundaries as
    transition supervision without inspecting, pairing, or augmenting examples.
+4. Structured attainable-state recovery that preserves correlations across
+   position and channel; independent fitted noise improves local learning but
+   pulls OOD-N states back toward the training distribution.
 
 Further width, dropout, Adam-family, attention, cellular, or state-space sweeps
 would mostly repeat the failure modes above.
