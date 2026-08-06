@@ -74,11 +74,29 @@ from k<=4 corrupted fields (7/8) — the basin exists; per-row-credit search can
 it. Conclusion: stop tuning the loss; change the search structure. (Affine solved in
 round 2 precisely because partial affine programs ARE visible to congruence credit.)
 
+## Round 3b (COMPLETE): the found affine core is PROVABLY irreducible — and the fix
+
+Exhaustive existence checks (20,640 canonical completions; 2.36M slot7×all-tables
+candidates; a causality screen over all 109 reachable S1 preloads) prove NO reducer
+completion exists in the seed-600 core's neighborhood: its integer materializes at
+once_post slot6 with only slot7 downstream, and the subtraction bands are not decodable
+from any reachable state. Search-dynamics corroboration: every congruence-weighted
+mixture makes the congruent core a local optimum; pure-exact credit re-enters the
+bitmatch attractor. THE FIX (ports directly): (1) stage-1 credit = congruence + range
+bonus (output < N) — endpoint-computable, kills the unreduced attractor; (2) reserve two
+trailing slots (pinned NEVER in stage 1) so a conditional-subtract completion always has
+room; (3) stage 2 becomes an exact enumeration (~20k candidates, seconds) — the
+exhaustive check showed the canonical conditional-subtract pair is the global-optimum
+completion over ALL 65,536 tables.
+
 ## In flight
 
-- Round 3b: affine stage-2 completion (joint slot×table-dict blocks from the stage-1
-  winner; protected-core GA; existence check of reducer completions in the winner's
-  neighborhood).
+- Affine end-to-end validation: revised stage-1 credit (congruence + range bonus,
+  reserved slots) -> GA -> stage-2 tier-1 enumeration -> full certification (exactness
+  at T in {1,2,3,6}, C2 necessity, width robustness). If it lands, this is the first
+  complete program discovered from endpoint-only credit in this machine.
+- Round 4 (squaring core): M1 quality-diversity (MAP-Elites); M2 template enumeration +
+  conditional table learning with H100 feasibility estimate.
 - Round 4 (squaring core, search-structure levers): M1 quality-diversity (MAP-Elites
   archive over behavior descriptors — stepping stones instead of fitness-only
   selection); M2 MDL-ordered template enumeration with conditional per-entry table
