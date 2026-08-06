@@ -38,6 +38,7 @@ few answers by chance.
 | position-only sequence feedback | fixed whole-answer random code | 0.33% | 14.78% | 9.71% | 16.38% | fixed-only gain; reject |
 | product ripple + decoupled feedback | stop-gradient learned local classifier | 0.50% | **15.74%** | **11.58%** | 16.65% | broad short gain; 60s exact rejected |
 | product ripple + modulus consensus | symmetric gradients across disjoint modulus families | **0.79%** | 15.24% | 11.38% | **17.82%** | short OOD gain; 60s not durable |
+| canonical categorical transition | observable digit state + finite categorical controller | 0.38% | **15.97%** | 11.17% | 17.07% | 60s signal decays; reject |
 | Fourier numeric operator | learned periodic scalar basis | failed fixed smoke | — | — | — | reject |
 | untied Transformer | specialized depth/full gradients | failed fixed smoke | — | — | — | reject |
 
@@ -79,3 +80,20 @@ submission rules do not permit participants to create.
 
 Further width, dropout, Adam-family, attention, cellular, or state-space sweeps
 would mostly repeat the failure modes above.
+
+## Endpoint-identification theorem diagnostic
+
+The canonical categorical wave includes a bounded constructive control. A
+randomly initialized transition table trained only on exhaustive T=1 endpoint
+pairs for `2 <= N <= 31` reaches 100% one-step accuracy and, without any deeper
+targets, 100% at every unseen T rung through 64. With only 60% of the one-step
+states covered, withheld T=1 accuracy is 6.57% and deep rollout accuracy falls
+to roughly 34%.
+
+This separates possibility from identification. Endpoint-only supervision is
+sufficient when the one-step examples distinguish a reusable canonical
+transition. The benchmark candidate supplies canonical state and weight tying,
+but its flexible local rule is not distinguished by the available
+variable-modulus endpoints. A next candidate must shrink that effective rule
+class or create a rules-valid generic teaching signal; more optimization of the
+same ambiguous transition cannot satisfy the positive theorem's premise.
