@@ -1,0 +1,587 @@
+<title>The canonical model — no hidden scratch paper</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root{
+    --bg:#EAEDF1; --surface:#F6F8FA; --surface-2:#E1E6EC;
+    --ink:#101720; --muted:#586573; --faint:#8A97A5;
+    --accent:#0E8C7F; --accent-soft:rgba(14,140,127,.12);
+    --signal:#B0670F; --signal-soft:rgba(176,103,15,.13);
+    --hair:#C7D0DA; --hair-strong:#AEB9C6;
+    --shadow:0 1px 2px rgba(16,23,32,.06),0 8px 30px rgba(16,23,32,.07);
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#0B111B; --surface:#121A26; --surface-2:#0F1722;
+      --ink:#DEE6EF; --muted:#8B99AB; --faint:#5E6D7E;
+      --accent:#39D6C0; --accent-soft:rgba(57,214,192,.12);
+      --signal:#F0AE4A; --signal-soft:rgba(240,174,74,.14);
+      --hair:rgba(125,145,166,.20); --hair-strong:rgba(125,145,166,.34);
+      --shadow:0 1px 2px rgba(0,0,0,.3),0 12px 40px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#EAEDF1; --surface:#F6F8FA; --surface-2:#E1E6EC;
+    --ink:#101720; --muted:#586573; --faint:#8A97A5;
+    --accent:#0E8C7F; --accent-soft:rgba(14,140,127,.12);
+    --signal:#B0670F; --signal-soft:rgba(176,103,15,.13);
+    --hair:#C7D0DA; --hair-strong:#AEB9C6;
+    --shadow:0 1px 2px rgba(16,23,32,.06),0 8px 30px rgba(16,23,32,.07);
+  }
+  :root[data-theme="dark"]{
+    --bg:#0B111B; --surface:#121A26; --surface-2:#0F1722;
+    --ink:#DEE6EF; --muted:#8B99AB; --faint:#5E6D7E;
+    --accent:#39D6C0; --accent-soft:rgba(57,214,192,.12);
+    --signal:#F0AE4A; --signal-soft:rgba(240,174,74,.14);
+    --hair:rgba(125,145,166,.20); --hair-strong:rgba(125,145,166,.34);
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 12px 40px rgba(0,0,0,.35);
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    font-size:17px; line-height:1.65; -webkit-font-smoothing:antialiased;
+  }
+  .mono{font-family:ui-monospace,"SF Mono","Cascadia Code","JetBrains Mono",Menlo,Consolas,monospace}
+  .wrap{max-width:760px;margin:0 auto;padding:0 24px}
+  h1,h2,h3{letter-spacing:-.02em;line-height:1.12;text-wrap:balance;font-weight:800}
+  h1{font-size:clamp(2.1rem,6vw,3.2rem);margin:.2em 0 .3em}
+  h2{font-size:clamp(1.4rem,3.4vw,1.9rem);margin:0 0 .5em}
+  h3{font-size:1.05rem;margin:1.4em 0 .4em}
+  p{margin:0 0 1.1em;max-width:66ch}
+  a{color:var(--accent)}
+  .eyebrow{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.72rem;
+    letter-spacing:.22em;text-transform:uppercase;color:var(--accent);font-weight:600}
+  .lede{font-size:clamp(1.05rem,2.2vw,1.28rem);color:var(--muted);max-width:60ch}
+
+  header{position:relative;overflow:hidden;border-bottom:1px solid var(--hair)}
+  header::before{content:"";position:absolute;inset:0;
+    background:
+      radial-gradient(120% 80% at 82% 8%,var(--accent-soft),transparent 60%),
+      linear-gradient(transparent 0 39px,var(--hair) 39px 40px),
+      linear-gradient(90deg,transparent 0 39px,var(--hair) 39px 40px);
+    background-size:auto,40px 40px,40px 40px;opacity:.5;pointer-events:none}
+  .hero{position:relative;padding:64px 0 44px}
+  .badges{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
+  .badge{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.74rem;
+    border:1px solid var(--hair-strong);border-radius:999px;padding:5px 11px;color:var(--muted)}
+
+  section{padding:52px 0;border-bottom:1px solid var(--hair)}
+  .step{display:grid;grid-template-columns:auto 1fr;gap:20px;align-items:start}
+  .num{font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:700;
+    font-size:.95rem;color:var(--accent);border:1px solid var(--hair-strong);
+    border-radius:10px;width:40px;height:40px;display:grid;place-items:center;
+    background:var(--surface);flex:none}
+  .step h2{margin-top:2px}
+  @media (max-width:560px){.step{grid-template-columns:1fr}.num{width:34px;height:34px}}
+
+  .card{background:var(--surface);border:1px solid var(--hair);border-radius:14px;
+    padding:20px 22px;box-shadow:var(--shadow)}
+  .callout{border-left:3px solid var(--signal);background:var(--signal-soft);
+    padding:14px 18px;border-radius:0 12px 12px 0;margin:1.2em 0;color:var(--ink)}
+  .callout .eyebrow{color:var(--signal)}
+  .callout p:last-child{margin-bottom:0}
+  figure{margin:1.5em 0;background:var(--surface);border:1px solid var(--hair);
+    border-radius:14px;padding:18px 16px 12px;box-shadow:var(--shadow);overflow-x:auto}
+  figcaption{font-size:.85rem;color:var(--faint);margin-top:.6em;text-align:center;
+    font-family:ui-monospace,Menlo,Consolas,monospace}
+  .chiprow{display:flex;flex-wrap:wrap;gap:8px;margin:.4em 0 1.1em}
+  .chip{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.78rem;
+    padding:4px 9px;border-radius:7px;background:var(--surface-2);color:var(--muted)}
+  .chip.good{color:var(--accent);background:var(--accent-soft)}
+  .chip.hard{color:var(--signal);background:var(--signal-soft)}
+  ul.clean{margin:.2em 0 1.1em;padding-left:1.1em;max-width:66ch}
+  ul.clean li{margin:.35em 0}
+  .foot{padding:38px 0 60px;color:var(--faint);font-size:.85rem}
+  svg{display:block;max-width:100%;height:auto;margin:0 auto;color:var(--ink)}
+  .svg-min{min-width:560px}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important}}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:4px}
+</style>
+
+<header>
+  <div class="wrap hero">
+    <div class="eyebrow">One Layer Deeper · concept note</div>
+    <h1>The canonical model: no&nbsp;hidden scratch&nbsp;paper</h1>
+    <p class="lede">Our networks kept finding clever ways to <em>look</em> right without
+      learning the arithmetic. This design removes every hiding place — and in doing so,
+      it turned a vague failure ("it doesn't generalize") into a precise one we can attack.</p>
+    <div class="badges">
+      <span class="badge">task: x^(2^T) mod N</span>
+      <span class="badge">idea: state = the answer itself</span>
+      <span class="badge">finding: the data, not the model, is the wall</span>
+    </div>
+  </div>
+</header>
+
+<section>
+  <div class="wrap step">
+    <div class="num">1</div>
+    <div>
+      <h2>The whole task is one move, repeated</h2>
+      <p>The benchmark asks: take a number <span class="mono">x</span>, square it, keep only
+        the remainder after dividing by <span class="mono">N</span> — and do that
+        <span class="mono">T</span> times in a row. That's it. The only move is
+        <strong>“square, then wrap around N.”</strong></p>
+      <p>So a model never needs to learn “the answer at depth 64.” It needs to learn the
+        <em>one move</em> correctly, and then run it in a loop:</p>
+
+      <figure>
+        <svg class="svg-min" role="img" viewBox="0 0 640 190"
+             aria-label="A single squaring cell is applied repeatedly: 13 becomes 16, 16 becomes 1, 1 stays 1, all modulo 17. The same cell is reused at every step."
+             fill="none" stroke-linecap="round">
+          <defs>
+            <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="currentColor" stroke="none"/>
+            </marker>
+          </defs>
+          <!-- chain of values -->
+          <g font-family="ui-monospace,Menlo,monospace" font-size="15" font-weight="700">
+            <rect x="20"  y="60" width="70" height="44" rx="9" stroke="currentColor" opacity=".55"/>
+            <text x="55"  y="87" text-anchor="middle" fill="currentColor" stroke="none">13</text>
+            <rect x="170" y="60" width="70" height="44" rx="9" stroke="currentColor" opacity=".55"/>
+            <text x="205" y="87" text-anchor="middle" fill="currentColor" stroke="none">16</text>
+            <rect x="320" y="60" width="70" height="44" rx="9" stroke="currentColor" opacity=".55"/>
+            <text x="355" y="87" text-anchor="middle" fill="currentColor" stroke="none">1</text>
+            <rect x="470" y="60" width="70" height="44" rx="9" stroke="currentColor" opacity=".55"/>
+            <text x="505" y="87" text-anchor="middle" fill="currentColor" stroke="none">1</text>
+          </g>
+          <!-- arrows with the shared cell label -->
+          <g stroke="var(--accent)" stroke-width="2">
+            <line x1="92"  y1="82" x2="166" y2="82" marker-end="url(#arr)" color="var(--accent)"/>
+            <line x1="242" y1="82" x2="316" y2="82" marker-end="url(#arr)" color="var(--accent)"/>
+            <line x1="392" y1="82" x2="466" y2="82" marker-end="url(#arr)" color="var(--accent)"/>
+          </g>
+          <g font-family="ui-monospace,Menlo,monospace" font-size="11" fill="var(--accent)" stroke="none" text-anchor="middle">
+            <text x="129" y="70">square,</text><text x="129" y="103">wrap 17</text>
+            <text x="279" y="70">square,</text><text x="279" y="103">wrap 17</text>
+            <text x="429" y="70">square,</text><text x="429" y="103">wrap 17</text>
+          </g>
+          <!-- brace: same cell -->
+          <path d="M129 118 v10 h300 v-10" stroke="var(--accent)" stroke-width="1.5" opacity=".7"/>
+          <text x="279" y="150" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="12" fill="var(--accent)" stroke="none">the SAME learned cell, reused every step</text>
+          <!-- rung labels -->
+          <g font-family="ui-monospace,Menlo,monospace" font-size="11" fill="currentColor" opacity=".55" stroke="none" text-anchor="middle">
+            <text x="55"  y="46">start</text>
+            <text x="205" y="46">T=1</text>
+            <text x="355" y="46">T=2</text>
+            <text x="505" y="46">T=3</text>
+          </g>
+          <!-- worked math under -->
+          <g font-family="ui-monospace,Menlo,monospace" font-size="11" fill="currentColor" opacity=".55" stroke="none" text-anchor="middle">
+            <text x="205" y="178">13²=169 → 16</text>
+            <text x="355" y="178">16²=256 → 1</text>
+            <text x="505" y="178">1²=1 → 1</text>
+          </g>
+        </svg>
+        <figcaption>One move, looped. Example with N=17, x=13: the chain is 13 → 16 → 1 → 1.</figcaption>
+      </figure>
+
+      <p>If the loop's single step is <em>exactly</em> right, every depth is free — depth 64
+        is just the step run 64 times. That's the prize. The catch is in the next section.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap step">
+    <div class="num">2</div>
+    <div>
+      <h2>The loophole: hidden scratch paper</h2>
+      <p>Training data only shows the model <strong>endpoints</strong>: the question and the
+        final answer. It never shows the intermediate values in the chain. A typical
+        neural network exploits that gap.</p>
+      <p>Most designs loop on an internal <em>hidden state</em> — a long list of unlabeled
+        numbers — and only translate it into an answer at the very end, through a separate
+        <em>decoder</em>. Nothing forces that hidden state to hold a real intermediate value.
+        The network can scribble anything on its private scratch paper, as long as the final
+        translation happens to match the training answers:</p>
+
+      <figure>
+        <svg class="svg-min" role="img" viewBox="0 0 640 420"
+             aria-label="Two designs compared. Top: a typical model encodes x into an opaque hidden state, loops on it, and decodes an answer only at the end — the loop never has to be a real squaring. Bottom: the canonical model's state is the readable digits of the current number; each step's output is the next step's input, so every step must be a real squaring."
+             fill="none" stroke-linecap="round">
+          <defs>
+            <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="currentColor" stroke="none"/>
+            </marker>
+          </defs>
+
+          <!-- ===== TOP: typical model ===== -->
+          <text x="20" y="26" font-family="ui-monospace,Menlo,monospace" font-size="12"
+                letter-spacing="2" fill="var(--signal)" stroke="none">TYPICAL MODEL — PRIVATE SCRATCH PAPER</text>
+
+          <g font-family="ui-monospace,Menlo,monospace" font-size="13" font-weight="700">
+            <rect x="20" y="60" width="64" height="40" rx="9" stroke="currentColor" opacity=".55"/>
+            <text x="52" y="85" text-anchor="middle" fill="currentColor" stroke="none">x</text>
+
+            <rect x="128" y="60" width="96" height="40" rx="9" stroke="currentColor" opacity=".55"/>
+            <text x="176" y="85" text-anchor="middle" fill="currentColor" stroke="none">encoder</text>
+
+            <!-- opaque blob -->
+            <rect x="272" y="48" width="150" height="64" rx="14" stroke="var(--signal)" stroke-width="2" fill="var(--signal-soft)"/>
+            <text x="347" y="75" text-anchor="middle" fill="var(--signal)" stroke="none" font-size="12">hidden state</text>
+            <text x="347" y="93" text-anchor="middle" fill="var(--signal)" stroke="none" font-size="11" font-weight="400">?? ?? ?? ?? ??</text>
+
+            <rect x="470" y="60" width="96" height="40" rx="9" stroke="currentColor" opacity=".55"/>
+            <text x="518" y="85" text-anchor="middle" fill="currentColor" stroke="none">decoder</text>
+
+            <text x="608" y="85" text-anchor="middle" fill="currentColor" stroke="none">42</text>
+          </g>
+          <g stroke="currentColor" stroke-width="1.6" opacity=".7">
+            <line x1="86" y1="80" x2="124" y2="80" marker-end="url(#arr2)"/>
+            <line x1="226" y1="80" x2="268" y2="80" marker-end="url(#arr2)"/>
+            <line x1="424" y1="80" x2="466" y2="80" marker-end="url(#arr2)"/>
+            <line x1="568" y1="80" x2="588" y2="80" marker-end="url(#arr2)"/>
+          </g>
+          <!-- loop on blob -->
+          <path d="M390 116 q30 40 -43 40 q-73 0 -43 -40" stroke="var(--signal)" stroke-width="2" marker-end="url(#arr2)" color="var(--signal)"/>
+          <text x="347" y="176" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="11" fill="var(--signal)" stroke="none">loops T times — on the scribbles</text>
+          <text x="347" y="205" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="11" fill="currentColor" opacity=".6" stroke="none">answer only checked HERE ➝ the loop is never forced to be a real squaring</text>
+
+          <!-- divider -->
+          <line x1="20" y1="228" x2="620" y2="228" stroke="currentColor" opacity=".18"/>
+
+          <!-- ===== BOTTOM: canonical model ===== -->
+          <text x="20" y="256" font-family="ui-monospace,Menlo,monospace" font-size="12"
+                letter-spacing="2" fill="var(--accent)" stroke="none">CANONICAL MODEL — THE STATE IS THE ANSWER</text>
+
+          <!-- digit registers in -->
+          <g font-family="ui-monospace,Menlo,monospace" font-size="14" font-weight="700">
+            <rect x="20"  y="290" width="34" height="40" rx="7" stroke="var(--accent)" stroke-width="1.6"/>
+            <rect x="58"  y="290" width="34" height="40" rx="7" stroke="var(--accent)" stroke-width="1.6"/>
+            <rect x="96"  y="290" width="34" height="40" rx="7" stroke="var(--accent)" stroke-width="1.6"/>
+            <text x="37"  y="315" text-anchor="middle" fill="currentColor" stroke="none">0</text>
+            <text x="75"  y="315" text-anchor="middle" fill="currentColor" stroke="none">1</text>
+            <text x="113" y="315" text-anchor="middle" fill="currentColor" stroke="none">3</text>
+          </g>
+          <text x="75" y="352" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="11" fill="var(--accent)" stroke="none">digits of x — readable</text>
+
+          <!-- tied step -->
+          <rect x="196" y="284" width="140" height="52" rx="12" stroke="var(--accent)" stroke-width="2" fill="var(--accent-soft)"/>
+          <text x="266" y="306" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="12" font-weight="700" fill="var(--accent)" stroke="none">one tied step</text>
+          <text x="266" y="324" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="11" fill="var(--accent)" stroke="none">square + wrap N</text>
+
+          <!-- snap -->
+          <rect x="392" y="284" width="92" height="52" rx="12" stroke="currentColor" opacity=".55"/>
+          <text x="438" y="306" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="12" fill="currentColor" stroke="none">snap</text>
+          <text x="438" y="324" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="10.5" fill="currentColor" opacity=".6" stroke="none">commit to digits</text>
+
+          <!-- digit registers out -->
+          <g font-family="ui-monospace,Menlo,monospace" font-size="14" font-weight="700">
+            <rect x="532" y="290" width="34" height="40" rx="7" stroke="var(--accent)" stroke-width="1.6"/>
+            <rect x="570" y="290" width="34" height="40" rx="7" stroke="var(--accent)" stroke-width="1.6"/>
+            <text x="549" y="315" text-anchor="middle" fill="currentColor" stroke="none">1</text>
+            <text x="587" y="315" text-anchor="middle" fill="currentColor" stroke="none">6</text>
+          </g>
+          <text x="568" y="352" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="11" fill="var(--accent)" stroke="none">digits again</text>
+
+          <g stroke="currentColor" stroke-width="1.6" opacity=".7">
+            <line x1="132" y1="310" x2="192" y2="310" marker-end="url(#arr2)"/>
+            <line x1="338" y1="310" x2="388" y2="310" marker-end="url(#arr2)"/>
+            <line x1="486" y1="310" x2="528" y2="310" marker-end="url(#arr2)"/>
+          </g>
+          <!-- feedback: output digits are the next input -->
+          <path d="M568 366 v22 h-493 v-42" stroke="var(--accent)" stroke-width="2" marker-end="url(#arr2)" color="var(--accent)"/>
+          <text x="330" y="380" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="11" fill="var(--accent)" stroke="none">the output digits ARE the next input — no decoder, nowhere to hide</text>
+        </svg>
+        <figcaption>Same loop, two designs. Top: only the last box is graded. Bottom: every step ends in plain digits.</figcaption>
+      </figure>
+
+      <p>In the top design, gradient descent usually finds the lazy solution: memorize
+        question→answer pairs inside the blob. The model aces training and collapses on any
+        fresh number — which is exactly the failure we kept measuring.</p>
+
+      <div class="callout">
+        <div class="eyebrow">The fix, in one sentence</div>
+        <p>Make the loop's state <strong>the answer itself</strong> — the ten possible decimal
+          digits in each column, snapped to a definite readout — so the only way to be right
+          at the end is to be right at <em>every step</em> along the way.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap step">
+    <div class="num">3</div>
+    <div>
+      <h2>Why “canonical”?</h2>
+      <p>A number has exactly one honest representation in this design: its digits. That's
+        what <em>canonical</em> means here — one agreed-upon form, no private encodings.
+        The model is built from three commitments:</p>
+      <ul class="clean">
+        <li><strong>Observable state.</strong> Between steps, the model may keep only a belief
+          over the ten digits <span class="mono">0–9</span> in each column, plus a small set of
+          named “modes” (think: <em>carrying</em>, <em>comparing</em>, <em>done</em>) — a short
+          menu of labeled options, not a free-form memory.</li>
+        <li><strong>Snap between steps</strong> (“straight-through” in the jargon): before the
+          digits feed back into the loop, they're committed to a definite readout. Fuzzy,
+          in-between states can't smuggle extra information forward.</li>
+        <li><strong>One shared rule.</strong> A single learned circuit handles every digit
+          column the same way and is reused at every depth. Learn it once, and it works on
+          numbers of any length — which is what an unseen, larger modulus requires.</li>
+      </ul>
+      <p>Note what is <em>not</em> in the design: no hand-coded arithmetic. The model still has
+        to <em>learn</em> squaring and wrapping from examples. The architecture only guarantees
+        that <strong>if</strong> it learns the right step, the step is reusable — memorization
+        no longer has a place to live.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap step">
+    <div class="num">4</div>
+    <div>
+      <h2>The proof that the idea works — in a small world</h2>
+      <p>Does endpoint-only training ever suffice? We tested it where we could check
+        everything: all moduli up to 31 — a world with only ~500 possible states. A model
+        (essentially a lookup table with the canonical shape) was trained <em>only</em> on
+        one-step questions and answers. It never saw a deeper example.</p>
+
+      <figure>
+        <svg class="svg-min" role="img" viewBox="0 0 640 330"
+             aria-label="Two training regimes compared. Left: every one-step fact is seen, the transition table is fully pinned down, and rolling it out is 100% correct even at depth 64. Right: 40% of one-step facts are withheld, leaving holes in the table; a rollout that hits a hole goes wrong and every later step inherits the error, giving 6.57% on withheld one-step questions and about 34% at depth."
+             fill="none" stroke-linecap="round">
+          <defs>
+            <marker id="arr3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="currentColor" stroke="none"/>
+            </marker>
+          </defs>
+
+          <!-- LEFT: full coverage -->
+          <text x="150" y="26" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="12" letter-spacing="2" fill="var(--accent)" stroke="none">SEE EVERY ONE-STEP FACT</text>
+          <g stroke="none">
+            <!-- 8x5 fully filled grid -->
+            <g fill="var(--accent)" opacity=".8">
+              <rect x="70" y="44" width="20" height="20" rx="4"/><rect x="94" y="44" width="20" height="20" rx="4"/><rect x="118" y="44" width="20" height="20" rx="4"/><rect x="142" y="44" width="20" height="20" rx="4"/><rect x="166" y="44" width="20" height="20" rx="4"/><rect x="190" y="44" width="20" height="20" rx="4"/><rect x="214" y="44" width="20" height="20" rx="4"/>
+              <rect x="70" y="68" width="20" height="20" rx="4"/><rect x="94" y="68" width="20" height="20" rx="4"/><rect x="118" y="68" width="20" height="20" rx="4"/><rect x="142" y="68" width="20" height="20" rx="4"/><rect x="166" y="68" width="20" height="20" rx="4"/><rect x="190" y="68" width="20" height="20" rx="4"/><rect x="214" y="68" width="20" height="20" rx="4"/>
+              <rect x="70" y="92" width="20" height="20" rx="4"/><rect x="94" y="92" width="20" height="20" rx="4"/><rect x="118" y="92" width="20" height="20" rx="4"/><rect x="142" y="92" width="20" height="20" rx="4"/><rect x="166" y="92" width="20" height="20" rx="4"/><rect x="190" y="92" width="20" height="20" rx="4"/><rect x="214" y="92" width="20" height="20" rx="4"/>
+              <rect x="70" y="116" width="20" height="20" rx="4"/><rect x="94" y="116" width="20" height="20" rx="4"/><rect x="118" y="116" width="20" height="20" rx="4"/><rect x="142" y="116" width="20" height="20" rx="4"/><rect x="166" y="116" width="20" height="20" rx="4"/><rect x="190" y="116" width="20" height="20" rx="4"/><rect x="214" y="116" width="20" height="20" rx="4"/>
+            </g>
+          </g>
+          <text x="150" y="160" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="11" fill="currentColor" opacity=".6" stroke="none">the one-step rule is fully pinned down</text>
+
+          <!-- left rollout: all good -->
+          <g font-family="ui-monospace,Menlo,monospace" font-size="12" font-weight="700">
+            <circle cx="80"  cy="205" r="14" stroke="var(--accent)" stroke-width="2"/>
+            <circle cx="128" cy="205" r="14" stroke="var(--accent)" stroke-width="2"/>
+            <circle cx="176" cy="205" r="14" stroke="var(--accent)" stroke-width="2"/>
+            <circle cx="224" cy="205" r="14" stroke="var(--accent)" stroke-width="2"/>
+            <g fill="var(--accent)" stroke="none" text-anchor="middle">
+              <text x="80"  y="209">✓</text><text x="128" y="209">✓</text>
+              <text x="176" y="209">✓</text><text x="224" y="209">✓</text>
+            </g>
+          </g>
+          <g stroke="currentColor" stroke-width="1.4" opacity=".6">
+            <line x1="96"  y1="205" x2="112" y2="205" marker-end="url(#arr3)"/>
+            <line x1="144" y1="205" x2="160" y2="205" marker-end="url(#arr3)"/>
+            <line x1="192" y1="205" x2="208" y2="205" marker-end="url(#arr3)"/>
+          </g>
+          <text x="152" y="243" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="11" fill="currentColor" opacity=".6" stroke="none">roll it out 64 times…</text>
+          <text x="152" y="278" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="15" font-weight="700" fill="var(--accent)" stroke="none">100% at EVERY depth</text>
+          <text x="152" y="298" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="11" fill="currentColor" opacity=".6" stroke="none">without one deep example</text>
+
+          <!-- divider -->
+          <line x1="320" y1="40" x2="320" y2="300" stroke="currentColor" opacity=".18"/>
+
+          <!-- RIGHT: 60% coverage -->
+          <text x="480" y="26" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="12" letter-spacing="2" fill="var(--signal)" stroke="none">WITHHOLD 40% OF THEM</text>
+          <g stroke="none">
+            <g fill="var(--accent)" opacity=".8">
+              <rect x="400" y="44" width="20" height="20" rx="4"/><rect x="448" y="44" width="20" height="20" rx="4"/><rect x="472" y="44" width="20" height="20" rx="4"/><rect x="520" y="44" width="20" height="20" rx="4"/><rect x="544" y="44" width="20" height="20" rx="4"/>
+              <rect x="400" y="68" width="20" height="20" rx="4"/><rect x="424" y="68" width="20" height="20" rx="4"/><rect x="496" y="68" width="20" height="20" rx="4"/><rect x="544" y="68" width="20" height="20" rx="4"/>
+              <rect x="424" y="92" width="20" height="20" rx="4"/><rect x="448" y="92" width="20" height="20" rx="4"/><rect x="496" y="92" width="20" height="20" rx="4"/><rect x="520" y="92" width="20" height="20" rx="4"/>
+              <rect x="400" y="116" width="20" height="20" rx="4"/><rect x="472" y="116" width="20" height="20" rx="4"/><rect x="520" y="116" width="20" height="20" rx="4"/><rect x="544" y="116" width="20" height="20" rx="4"/>
+            </g>
+            <!-- holes -->
+            <g fill="none" stroke="var(--signal)" stroke-width="1.6" stroke-dasharray="3 3">
+              <rect x="424" y="44" width="20" height="20" rx="4"/><rect x="496" y="44" width="20" height="20" rx="4"/>
+              <rect x="448" y="68" width="20" height="20" rx="4"/><rect x="472" y="68" width="20" height="20" rx="4"/><rect x="520" y="68" width="20" height="20" rx="4"/>
+              <rect x="400" y="92" width="20" height="20" rx="4"/><rect x="472" y="92" width="20" height="20" rx="4"/><rect x="544" y="92" width="20" height="20" rx="4"/>
+              <rect x="424" y="116" width="20" height="20" rx="4"/><rect x="448" y="116" width="20" height="20" rx="4"/><rect x="496" y="116" width="20" height="20" rx="4"/>
+            </g>
+          </g>
+          <text x="480" y="160" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="11" fill="currentColor" opacity=".6" stroke="none">holes = one-step facts it must guess</text>
+
+          <!-- right rollout: error propagates -->
+          <g font-family="ui-monospace,Menlo,monospace" font-size="12" font-weight="700">
+            <circle cx="410" cy="205" r="14" stroke="var(--accent)" stroke-width="2"/>
+            <circle cx="458" cy="205" r="14" stroke="var(--signal)" stroke-width="2" stroke-dasharray="3 3"/>
+            <circle cx="506" cy="205" r="14" stroke="var(--signal)" stroke-width="2"/>
+            <circle cx="554" cy="205" r="14" stroke="var(--signal)" stroke-width="2"/>
+            <g stroke="none" text-anchor="middle">
+              <text x="410" y="209" fill="var(--accent)">✓</text>
+              <text x="458" y="209" fill="var(--signal)">?</text>
+              <text x="506" y="209" fill="var(--signal)">✗</text>
+              <text x="554" y="209" fill="var(--signal)">✗</text>
+            </g>
+          </g>
+          <g stroke="currentColor" stroke-width="1.4" opacity=".6">
+            <line x1="426" y1="205" x2="442" y2="205" marker-end="url(#arr3)"/>
+            <line x1="474" y1="205" x2="490" y2="205" marker-end="url(#arr3)"/>
+            <line x1="522" y1="205" x2="538" y2="205" marker-end="url(#arr3)"/>
+          </g>
+          <text x="482" y="243" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="11" fill="var(--signal)" stroke="none">one hole poisons every later step</text>
+          <text x="482" y="278" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="15" font-weight="700" fill="var(--signal)" stroke="none">6.57% on withheld · ~34% deep</text>
+          <text x="482" y="298" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="11" fill="currentColor" opacity=".6" stroke="none">same model, same training — less coverage</text>
+        </svg>
+        <figcaption>Moduli 2–31, trained on one-step endpoints only. Coverage decides everything.</figcaption>
+      </figure>
+
+      <p>The clean result: with <strong>every</strong> one-step fact in training, the model was
+        100% correct at one step — and then 100% correct at depths 2, 4, 8, … 64, none of
+        which it had ever seen. Endpoint-only supervision <em>can</em> teach a loopable rule.
+        With only 60% of the facts, accuracy on withheld one-step questions fell to 6.57%,
+        and deep rollouts to roughly a third.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap step">
+    <div class="num">5</div>
+    <div>
+      <h2>The real wall: many rules fit the same data</h2>
+      <p>Now the uncomfortable part. On the actual benchmark this canonical model scored
+        about <strong>0.4%</strong> — no better than its predecessors. The small-world proof
+        tells us exactly why, and it isn't capacity or training speed.</p>
+      <p>The benchmark's numbers are hundreds of digits long. Its training set — a few
+        thousand examples — covers a vanishing sliver of possible one-step facts. And a
+        flexible learned rule is like a form with many blanks: the training data fills in a
+        few, and <em>everything consistent with those blanks</em> is a rule the model might
+        settle on. Almost all of them are wrong everywhere else:</p>
+
+      <figure>
+        <svg class="svg-min" role="img" viewBox="0 0 640 300"
+             aria-label="Rule space under two data regimes. Left, the small world: endpoint facts act as constraints that narrow the space of candidate rules down to a single point, the true rule. Right, the benchmark: the same constraints leave a large region of surviving candidate rules that all match the training data; the true rule is one dot among many, and the model has no way to prefer it."
+             fill="none" stroke-linecap="round">
+          <!-- LEFT -->
+          <text x="155" y="26" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="12" letter-spacing="2" fill="var(--accent)" stroke="none">SMALL WORLD, FULL COVERAGE</text>
+          <ellipse cx="155" cy="140" rx="120" ry="88" stroke="currentColor" opacity=".4" stroke-dasharray="4 4"/>
+          <text x="155" y="70" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="10.5" fill="currentColor" opacity=".55" stroke="none">all rules the model could learn</text>
+          <!-- constraint lines carving -->
+          <g stroke="var(--accent)" stroke-width="1.4" opacity=".65">
+            <line x1="60"  y1="90"  x2="250" y2="180"/>
+            <line x1="70"  y1="200" x2="240" y2="86"/>
+            <line x1="155" y1="52"  x2="155" y2="228"/>
+            <line x1="46"  y1="140" x2="264" y2="140"/>
+          </g>
+          <circle cx="155" cy="140" r="7" fill="var(--accent)" stroke="none"/>
+          <text x="155" y="252" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="11" fill="var(--accent)" stroke="none">facts cross at ONE point:</text>
+          <text x="155" y="270" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="11" font-weight="700" fill="var(--accent)" stroke="none">the true rule — identified</text>
+
+          <!-- divider -->
+          <line x1="320" y1="40" x2="320" y2="276" stroke="currentColor" opacity=".18"/>
+
+          <!-- RIGHT -->
+          <text x="480" y="26" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="12" letter-spacing="2" fill="var(--signal)" stroke="none">THE BENCHMARK</text>
+          <ellipse cx="480" cy="140" rx="120" ry="88" stroke="currentColor" opacity=".4" stroke-dasharray="4 4"/>
+          <text x="480" y="70" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="10.5" fill="currentColor" opacity=".55" stroke="none">all rules the model could learn</text>
+          <!-- only two constraints -->
+          <g stroke="var(--accent)" stroke-width="1.4" opacity=".65">
+            <line x1="385" y1="95" x2="575" y2="175"/>
+            <line x1="395" y1="205" x2="565" y2="95"/>
+          </g>
+          <!-- survivor cloud -->
+          <g fill="var(--signal)" stroke="none" opacity=".85">
+            <circle cx="452" cy="128" r="5"/>
+            <circle cx="500" cy="118" r="5"/>
+            <circle cx="522" cy="150" r="5"/>
+            <circle cx="470" cy="165" r="5"/>
+            <circle cx="440" cy="150" r="5"/>
+            <circle cx="508" cy="176" r="5"/>
+          </g>
+          <circle cx="481" cy="143" r="7" fill="var(--accent)" stroke="none"/>
+          <text x="480" y="252" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="11" fill="var(--signal)" stroke="none">many survivors fit the data equally well —</text>
+          <text x="480" y="270" text-anchor="middle" font-family="ui-monospace,Menlo,monospace"
+                font-size="11" font-weight="700" fill="var(--signal)" stroke="none">the true rule is NOT identified</text>
+        </svg>
+        <figcaption>Each training fact is a constraint on rule space. Identification = the constraints cross at one point.</figcaption>
+      </figure>
+
+      <div class="callout">
+        <div class="eyebrow">The reframe</div>
+        <p>Before: “our models can't <em>compute</em> modular squaring.” After: <strong>“the
+          training endpoints don't <em>single out</em> which rule to learn.”</strong> The
+          canonical design guarantees a correct rule would loop perfectly — but the data never
+          points the optimizer at the correct rule. The wall is <em>identifiability</em>,
+          not architecture, capacity, or compute.</p>
+      </div>
+
+      <p>This is a genuinely better problem to have, because it dictates the moves. More
+        optimizer tricks, wider networks, and longer training all polish the wrong thing —
+        our experiment table shows dozens of them landing in the same 0.3–1% band. What can
+        work is narrowing the blanks or adding constraints:</p>
+      <ul class="clean">
+        <li><strong>Shrink the rule class.</strong> Structure the learned step (e.g., around a
+          division-free reduction scheme) so far fewer wrong rules are expressible — then the
+          same endpoints pin down more.</li>
+        <li><strong>Mine the depth rungs.</strong> Training data includes T=1, 2 and 3 for
+          related inputs; used carefully (and within the rules), consecutive rungs constrain
+          the <em>step</em>, not just the endpoint.</li>
+        <li><strong>Local learning signals.</strong> Give each step of the loop its own
+          nudge toward consistency, instead of one end-of-chain grade diluted across
+          every step.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap step">
+    <div class="num">6</div>
+    <div>
+      <h2>The concept on one card</h2>
+      <div class="card">
+        <p style="margin-bottom:.6em"><strong>Canonical model</strong> — a looped network whose
+          only carried state is the thing being computed: the digits of the current number,
+          snapped to a definite readout between steps, transformed by one shared rule.</p>
+        <div class="chiprow" style="margin-bottom:0">
+          <span class="chip good">closes: memorize-and-decode loophole</span>
+          <span class="chip good">guarantees: right step ⇒ right at any depth</span>
+          <span class="chip hard">doesn't guarantee: data picks the right step</span>
+          <span class="chip hard">next: make the data identify the rule</span>
+        </div>
+      </div>
+      <p style="margin-top:1.2em">It didn't beat the benchmark. It did something arguably more
+        valuable: it isolated the one question that decides this challenge — <em>can the
+        available endpoints be made to identify a reusable squaring step?</em> Every next
+        experiment now attacks that question directly.</p>
+    </div>
+  </div>
+</section>
+
+<div class="wrap foot">
+  One Layer Deeper · canonical categorical transition, explained ·
+  companion to <span class="mono">submissions/canonical_categorical_transition/</span> ·
+  small-world numbers from <span class="mono">proof_endpoint_identification.py</span> (moduli 2–31, T=1-only training)
+</div>
