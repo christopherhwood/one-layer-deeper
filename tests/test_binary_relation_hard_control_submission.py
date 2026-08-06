@@ -120,6 +120,66 @@ class BinaryRelationHardControlSubmissionTest(unittest.TestCase):
         )
         self.assertTrue(torch.equal(predictions, target))
 
+    def test_learned_max_width_program_covers_every_hard_ladder_rung(self) -> None:
+        torch.manual_seed(74)
+        model = MODULE.build_model(ModelSpec(17, 21, 500_000_000))
+        learned_choices = (
+            (model.beta_logits, MODULE.BETA_VALUES.index(-1.0)),
+            (model.gamma_logits, MODULE.GAMMA_VALUES.index(-2.0)),
+            (model.branch_logits, 1),
+            (model.invert_modulus_logits, 1),
+            (model.reduction_carry_logits, 1),
+            (model.scan_direction_logits, 1),
+            (model.slot1_rhs_logits, 0),
+            (model.slot2_rhs_logits, 1),
+            (model.commit_logits, 1),
+        )
+        with torch.no_grad():
+            for logits, choice in learned_choices:
+                logits.fill_(-10.0)
+                logits[choice] = 10.0
+        model.eval()
+
+        ladder = (1, 2, 4, 8, 16, 32, 64)
+        cases = [
+            (99_999_989 - 2 * row, 91_357_913 - 97 * row, time_steps)
+            for row, time_steps in enumerate(ladder)
+        ]
+        prompts = []
+        for modulus, value, time_steps in cases:
+            prompts.append(
+                [MODULE.N_MARK]
+                + [MODULE.DIGIT_OFFSET + int(digit) for digit in str(modulus)]
+                + [MODULE.X_MARK]
+                + [MODULE.DIGIT_OFFSET + int(digit) for digit in str(value)]
+                + [MODULE.T_MARK]
+                + [
+                    MODULE.DIGIT_OFFSET + int(digit)
+                    for digit in str(time_steps)
+                ]
+            )
+        input_ids = torch.zeros(len(prompts), 21, dtype=torch.long)
+        attention = torch.zeros_like(input_ids, dtype=torch.bool)
+        for row, prompt in enumerate(prompts):
+            input_ids[row, : len(prompt)] = torch.tensor(prompt)
+            attention[row, : len(prompt)] = True
+
+        with torch.no_grad():
+            logits, _ = model(input_ids, attention)
+        predictions = logits.argmax(dim=-1)
+        for row, ((modulus, value, time_steps), prompt) in enumerate(
+            zip(cases, prompts, strict=True)
+        ):
+            expected = str(pow(value, 1 << time_steps, modulus))
+            target = torch.tensor(
+                [MODULE.DIGIT_OFFSET + int(digit) for digit in expected]
+            )
+            start = len(prompt) - len(expected)
+            self.assertTrue(
+                torch.equal(predictions[row, start : len(prompt)], target),
+                msg=f"failed max-width T={time_steps}",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
