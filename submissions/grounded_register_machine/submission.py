@@ -2,8 +2,9 @@
 
 Every example executes the same short learned program.  A program phase makes
 only observable generic choices: which canonical tape to read twice, which
-canonical tape to write, and which direction to scan.  One finite-state local
-cell is tied across every digit, program phase, and outer square.  The answer
+canonical tape to write. Generic alternating scan directions expose both
+neighborhoods without evaluating both on every phase. One finite-state local
+cell is tied across every digit, program phase, and outer square. The answer
 digit tape is the submitted output and the next square's input; a scratch digit
 tape is required to return to the canonical all-zero state at the boundary.
 
@@ -85,16 +86,9 @@ class LocalTapeCell(nn.Module):
         input_width = (
             3 * NUM_DIGITS + HIDDEN + CONTROL_STATES + 2 + DIRECTIONS
         )
-        self.input = nn.Linear(input_width, 2 * HIDDEN)
-        self.norm = RMSNorm(2 * HIDDEN)
-        self.body = nn.Sequential(
-            nn.Linear(2 * HIDDEN, 2 * HIDDEN, bias=False),
-            nn.SiLU(),
-            nn.Linear(2 * HIDDEN, HIDDEN, bias=False),
-            nn.SiLU(),
-        )
-        self.digit = nn.Linear(HIDDEN, NUM_DIGITS)
-        self.control = nn.Linear(HIDDEN, CONTROL_STATES)
+        self.input = nn.Linear(input_width, HIDDEN)
+        self.norm = RMSNorm(HIDDEN)
+        self.output = nn.Linear(HIDDEN, NUM_DIGITS + CONTROL_STATES)
         self.identity_scale = nn.Parameter(torch.tensor(0.0))
 
     def forward(
@@ -109,7 +103,7 @@ class LocalTapeCell(nn.Module):
         temperature: float,
         hardness: float,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        hidden = self.body(
+        hidden = F.silu(
             self.norm(
                 self.input(
                     torch.cat(
@@ -128,8 +122,11 @@ class LocalTapeCell(nn.Module):
             )
         )
         residual = F.softplus(self.identity_scale)
-        digit_logits = self.digit(hidden) + residual * destination
-        control_logits = self.control(hidden) + residual * control
+        digit_update, control_update = self.output(hidden).split(
+            (NUM_DIGITS, CONTROL_STATES), dim=-1
+        )
+        digit_logits = digit_update + residual * destination
+        control_logits = control_update + residual * control
         next_digit, digit_soft = _straight_through_choice(
             digit_logits, temperature, hardness
         )
@@ -163,13 +160,9 @@ class GroundedProgramSquare(nn.Module):
         self.write_logits = nn.Parameter(
             torch.empty(PROGRAM_STEPS, WRITE_TAPES)
         )
-        self.direction_logits = nn.Parameter(
-            torch.empty(PROGRAM_STEPS, DIRECTIONS)
-        )
         nn.init.normal_(self.read_a_logits, std=0.02)
         nn.init.normal_(self.read_b_logits, std=0.02)
         nn.init.normal_(self.write_logits, std=0.02)
-        nn.init.normal_(self.direction_logits, std=0.02)
 
     def _product_columns(self, register: Tensor) -> Tensor:
         batch = register.shape[0]
@@ -197,43 +190,40 @@ class GroundedProgramSquare(nn.Module):
     def _read(tapes: Tensor, choice: Tensor) -> Tensor:
         return torch.einsum("t,tbwd->bwd", choice, tapes)
 
-    def _both_directions(
+    def _scan(
         self,
         read_a: Tensor,
         read_b: Tensor,
         destination: Tensor,
         product: Tensor,
         boundary: Tensor,
+        reverse: bool,
         temperature: float,
         hardness: float,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """Evaluate both scan orders in one doubled-batch sequential pass."""
-
+        """Run one generic sweep, alternating direction between phases."""
         batch = destination.shape[0]
-        paired_a = torch.cat((read_a, read_a.flip(1)), dim=0)
-        paired_b = torch.cat((read_b, read_b.flip(1)), dim=0)
-        paired_destination = torch.cat(
-            (destination, destination.flip(1)), dim=0
-        )
-        paired_product = torch.cat((product, product.flip(1)), dim=0)
-        paired_boundary = torch.cat((boundary, boundary.flip(1)), dim=0)
-        direction = destination.new_zeros(2 * batch, DIRECTIONS)
-        direction[:batch, 0] = 1.0
-        direction[batch:, 1] = 1.0
-        control = destination.new_zeros(2 * batch, CONTROL_STATES)
+        if reverse:
+            read_a = read_a.flip(1)
+            read_b = read_b.flip(1)
+            destination = destination.flip(1)
+            product = product.flip(1)
+            boundary = boundary.flip(1)
+        direction = destination.new_zeros(batch, DIRECTIONS)
+        direction[:, int(reverse)] = 1.0
+        control = destination.new_zeros(batch, CONTROL_STATES)
         control[:, 0] = 1.0
-
         digits: list[Tensor] = []
         logits: list[Tensor] = []
         control_soft_states: list[Tensor] = []
         for position in range(self.columns):
             digit, control, digit_logits, control_soft = self.cell(
-                paired_a[:, position],
-                paired_b[:, position],
-                paired_destination[:, position],
-                paired_product[:, position],
+                read_a[:, position],
+                read_b[:, position],
+                destination[:, position],
+                product[:, position],
                 control,
-                paired_boundary[:, position],
+                boundary[:, position],
                 direction,
                 temperature,
                 hardness,
@@ -245,15 +235,11 @@ class GroundedProgramSquare(nn.Module):
         digit_tape = torch.stack(digits, dim=1)
         logit_tape = torch.stack(logits, dim=1)
         control_soft = torch.stack(control_soft_states, dim=1)
-        forward_digits = digit_tape[:batch]
-        reverse_digits = digit_tape[batch:].flip(1)
-        forward_logits = logit_tape[:batch]
-        reverse_logits = logit_tape[batch:].flip(1)
-        return (
-            torch.stack((forward_digits, reverse_digits), dim=0),
-            torch.stack((forward_logits, reverse_logits), dim=0),
-            control_soft,
-        )
+        if reverse:
+            digit_tape = digit_tape.flip(1)
+            logit_tape = logit_tape.flip(1)
+            control_soft = control_soft.flip(1)
+        return digit_tape, logit_tape, control_soft
 
     def forward(
         self,
@@ -298,18 +284,12 @@ class GroundedProgramSquare(nn.Module):
                 program_temperature,
                 program_hardness,
             )
-            direction, direction_soft = _straight_through_choice(
-                self.direction_logits[phase],
-                program_temperature,
-                program_hardness,
-            )
             program_entropy_terms.extend(
                 _entropy(choice)
                 for choice in (
                     read_a_soft,
                     read_b_soft,
                     write_soft,
-                    direction_soft,
                 )
             )
 
@@ -317,24 +297,17 @@ class GroundedProgramSquare(nn.Module):
             first_read = self._read(tapes, read_a)
             second_read = self._read(tapes, read_b)
             destination = write[0] * answer + write[1] * scratch
-            scan_digits, scan_logits, control_soft = self._both_directions(
+            selected_digits, selected_logits, control_soft = self._scan(
                 first_read,
                 second_read,
                 destination,
                 product,
                 boundary,
+                bool(phase % 2),
                 state_temperature,
                 state_hardness,
             )
             control_soft_states.append(control_soft)
-            selected_digits = (
-                direction[0] * scan_digits[0]
-                + direction[1] * scan_digits[1]
-            )
-            selected_logits = (
-                direction[0] * scan_logits[0]
-                + direction[1] * scan_logits[1]
-            )
             answer = write[0] * selected_digits + write[1] * answer
             scratch = write[1] * selected_digits + write[0] * scratch
             answer_logits = (
@@ -682,6 +655,6 @@ SUBMISSION = Submission(
     build_model=build_model,
     build_optimizer=build_optimizer,
     token_training_loss=token_training_loss,
-    batch_size=128,
+    batch_size=512,
     eval_batch_size=512,
 )

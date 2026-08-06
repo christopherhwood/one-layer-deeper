@@ -53,6 +53,9 @@ few answers by chance.
 | convolutional Neural GPU | 1,502 | 6.2% | 1.1% | 0.7% | 0.88% |
 | scaled general Transformer | 1,259 | 18.0% | 1.0% | 0.0% | 0.50% |
 | position-only product mixer (Hard) | 139,579 | 0.0% (1.6% max) | 0.0% | 0.0% | 0.03% |
+| grounded program, vectorized controller | 336 | 0.8% | 0.7% | 1.3% | 1.00% |
+| grounded program, fast batch 128 | 300 | 0.0% | 0.6% | 1.0% | 0.79% |
+| grounded program, fast batch 512 | 244 | 0.4% | 0.7% | 0.8% | 0.75% |
 
 No candidate certifies seen or OOD-N T=1.  The H100 runs separate three failure
 modes: general cellular recurrence cannot fit the variable task despite healthy
@@ -109,3 +112,7 @@ six-phase model scores only 15.75% token accuracy on unseen-modulus T=1. A
 four-phase ablation fits training faster while generalizing worse. Global
 program sharing therefore does not identify the program when the selected
 operations are implemented by a still-flexible monolithic local transition.
+On H100, vectorizing all controller alternatives reaches 1.00%; simplifying the
+cell and raising batch size from 128 to 512 increases processed examples from
+38,400 to 124,928 but scores only 0.75%. The failure therefore persists after a
+3.25x data-throughput gain and is not explained by accelerator starvation.
