@@ -1,10 +1,11 @@
-"""Hard-tier global posterior over recurrent binary relations.
+"""Hard-tier factorized posterior over one recurrent discrete program.
 
-The architecture supplies randomly initialized trainable particles over a
-symmetric 5 x 7 x 2 class of small affine local relations.  A second randomly
-initialized learned posterior chooses one complete relation from final evaluator
-answers.  The chosen relation is shared across every bit, example, modulus,
-modular-add pass, squaring step, and recurrence depth.
+Seven randomly initialized categorical vectors define one global program:
+two small affine-relation coefficients, branch polarity, modulus transform,
+reduction carry, scan direction, and bit-gate polarity.  Training exactly
+marginalizes their small Cartesian hypothesis class using evaluator endpoints.
+Evaluation executes only the learned joint MAP program, shared across every
+bit, example, modulus, squaring step, and recurrence depth.
 """
 
 from __future__ import annotations
@@ -32,16 +33,15 @@ X_MARK = 3
 T_MARK = 4
 DIGIT_OFFSET = 7
 NUM_DIGITS = 10
-PROGRAMS = 4096
+PROGRAMS = 5 * 7 * 2 * 2 * 2 * 2 * 2
 MAX_OUTER_STEPS = 64
 POSTERIOR_LR = 2e-1
-RELATION_LR = 1e-4
 DECODER_LR = 2e-3
 BIT_LOSS_WEIGHT = 1.0
 DIRECT_LOSS_WEIGHT = 0.01
-SURROGATE_SCALE = 1e-3
 BETA_VALUES = (-2.0, -1.0, 0.0, 1.0, 2.0)
 GAMMA_VALUES = (-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0)
+FIELD_SIZES = (5, 7, 2, 2, 2, 2, 2)
 
 
 class Config:
@@ -64,28 +64,32 @@ class Model(nn.Module):
         self.bit_width = (3322 * self.decimal_width + 999) // 1000 + 2
         self.particles = PROGRAMS
         self.beta_logits = nn.Parameter(
-            torch.randn(self.particles, len(BETA_VALUES)) * 0.05
+            torch.randn(len(BETA_VALUES)) * 0.02
         )
         self.gamma_logits = nn.Parameter(
-            torch.randn(self.particles, len(GAMMA_VALUES)) * 0.05
+            torch.randn(len(GAMMA_VALUES)) * 0.02
         )
         self.branch_logits = nn.Parameter(
-            torch.randn(self.particles, 2) * 0.05
+            torch.randn(2) * 0.02
         )
         self.invert_modulus_logits = nn.Parameter(
-            torch.randn(self.particles, 2) * 0.05
+            torch.randn(2) * 0.02
         )
         self.reduction_carry_logits = nn.Parameter(
-            torch.randn(self.particles, 2) * 0.05
+            torch.randn(2) * 0.02
         )
         self.scan_direction_logits = nn.Parameter(
-            torch.randn(self.particles, 2) * 0.05
+            torch.randn(2) * 0.02
         )
         self.bit_gate_logits = nn.Parameter(
-            torch.randn(self.particles, 2) * 0.05
+            torch.randn(2) * 0.02
         )
-        self.program_logits = nn.Parameter(
-            torch.randn(self.particles) * 0.02
+        self.register_buffer(
+            "program_choices",
+            torch.cartesian_prod(
+                *(torch.arange(size) for size in FIELD_SIZES)
+            ),
+            persistent=True,
         )
         hidden = 64
         self.decimal_decoder = nn.Sequential(
@@ -95,51 +99,28 @@ class Model(nn.Module):
         )
         self.transition_sharpness = 2.0
 
-    def _categorical_choice(
-        self, logits: Tensor, values: tuple[float, ...]
-    ) -> Tensor:
-        probability = F.softmax(logits, dim=-1)
-        hard = F.one_hot(
-            probability.argmax(dim=-1), probability.shape[-1]
-        ).to(probability.dtype)
-        if self.training:
-            choice = hard + SURROGATE_SCALE * (
-                probability - probability.detach()
-            )
-        else:
-            choice = hard
-        return choice @ logits.new_tensor(values)
-
     def _programs(self, indices: Tensor | None = None) -> Tensor:
         if indices is None:
             indices = torch.arange(
-                self.particles, device=self.program_logits.device
+                self.particles, device=self.program_choices.device
             )
-        beta = self._categorical_choice(
-            self.beta_logits[indices], BETA_VALUES
+        choices = self.program_choices[indices]
+        beta_values = self.beta_logits.new_tensor(BETA_VALUES)
+        gamma_values = self.gamma_logits.new_tensor(GAMMA_VALUES)
+        return torch.stack(
+            (
+                beta_values[choices[:, 0]],
+                gamma_values[choices[:, 1]],
+                choices[:, 2].to(self.beta_logits.dtype),
+            ),
+            dim=-1,
         )
-        gamma = self._categorical_choice(
-            self.gamma_logits[indices], GAMMA_VALUES
-        )
-        orientation = self._categorical_choice(
-            self.branch_logits[indices], (0.0, 1.0)
-        )
-        return torch.stack((beta, gamma, orientation), dim=-1)
 
     def _controls(self, indices: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        return (
-            self._categorical_choice(
-                self.invert_modulus_logits[indices], (0.0, 1.0)
-            ),
-            self._categorical_choice(
-                self.reduction_carry_logits[indices], (0.0, 1.0)
-            ),
-            self._categorical_choice(
-                self.scan_direction_logits[indices], (0.0, 1.0)
-            ),
-            self._categorical_choice(
-                self.bit_gate_logits[indices], (0.0, 1.0)
-            ),
+        choices = self.program_choices[indices]
+        return tuple(
+            choices[:, field].to(self.beta_logits.dtype)
+            for field in range(3, 7)
         )
 
     def _transition_tables(self, indices: Tensor) -> Tensor:
@@ -165,12 +146,7 @@ class Model(nn.Module):
         hard = F.one_hot(
             probability.argmax(dim=-1), 4
         ).to(probability.dtype)
-        if self.training:
-            probability = hard + SURROGATE_SCALE * (
-                probability - probability.detach()
-            )
-        else:
-            probability = hard
+        probability = hard
         return probability.reshape(-1, 2, 2, 2, 2, 2)
 
     def _scan_add(
@@ -349,7 +325,20 @@ class Model(nn.Module):
         return F.one_hot(bits, 2).float()
 
     def _program_log_weights(self) -> Tensor:
-        return F.log_softmax(self.program_logits, dim=0)
+        choices = self.program_choices
+        field_logits = (
+            self.beta_logits,
+            self.gamma_logits,
+            self.branch_logits,
+            self.invert_modulus_logits,
+            self.reduction_carry_logits,
+            self.scan_direction_logits,
+            self.bit_gate_logits,
+        )
+        return sum(
+            F.log_softmax(logits, dim=0)[choices[:, field]]
+            for field, logits in enumerate(field_logits)
+        )
 
     def _place_logits(
         self, digit_logits_lsd: Tensor, lengths: Tensor, prompt: int
@@ -509,7 +498,7 @@ class Model(nn.Module):
             self.decimal_width, device=value.device
         )
         digits = (value[:, None] // decimal_powers[None]).remainder(10)
-        logits = self.program_logits.new_full(
+        logits = self.beta_logits.new_full(
             (value.shape[0], self.decimal_width, NUM_DIGITS), -16.0
         )
         logits.scatter_(2, digits.unsqueeze(-1), 0.0)
@@ -706,8 +695,7 @@ def build_model(spec: ModelSpec) -> Model:
 
 
 def build_optimizer(model: Model, spec: OptimizerSpec) -> OptimizerBundle:
-    posterior = [model.program_logits]
-    relation = [
+    posterior = [
         model.beta_logits,
         model.gamma_logits,
         model.branch_logits,
@@ -716,9 +704,7 @@ def build_optimizer(model: Model, spec: OptimizerSpec) -> OptimizerBundle:
         model.scan_direction_logits,
         model.bit_gate_logits,
     ]
-    structured_ids = {
-        id(parameter) for parameter in (*posterior, *relation)
-    }
+    structured_ids = {id(parameter) for parameter in posterior}
     decoder = [
         parameter
         for parameter in model.parameters()
@@ -731,12 +717,6 @@ def build_optimizer(model: Model, spec: OptimizerSpec) -> OptimizerBundle:
                 "weight_decay": 0.0,
                 "lr": POSTERIOR_LR,
                 "base_lr": POSTERIOR_LR,
-            },
-            {
-                "params": relation,
-                "weight_decay": 0.0,
-                "lr": RELATION_LR,
-                "base_lr": RELATION_LR,
             },
             {
                 "params": decoder,

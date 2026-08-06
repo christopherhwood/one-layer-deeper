@@ -51,23 +51,44 @@ class BinaryRelationHardControlSubmissionTest(unittest.TestCase):
             )
         )
 
-    def test_seed74_has_canonical_particle_and_t64_capacity(self) -> None:
+    def test_seed74_starts_wrong_but_learned_map_has_t64_capacity(self) -> None:
         torch.manual_seed(74)
         model = MODULE.build_model(ModelSpec(17, 21, 500_000_000))
-        programs = model._programs()
-        controls = model._controls(torch.arange(model.particles))
-        canonical_mask = (
-            (programs[:, 0] == -1)
-            & (programs[:, 1] == -2)
-            & (programs[:, 2] == 1)
+        initial = int(model._program_log_weights().argmax())
+        initial_program = model._programs(torch.tensor([initial]))[0]
+        initial_controls = model._controls(torch.tensor([initial]))
+        initial_signature = (
+            float(initial_program[0]),
+            float(initial_program[1]),
+            int(initial_program[2]),
+            *(int(control[0]) for control in initial_controls),
         )
-        for control in controls:
-            canonical_mask &= control == 1
-        canonical = canonical_mask.nonzero(as_tuple=False).flatten()
-        self.assertGreaterEqual(canonical.numel(), 1)
+        canonical_signature = (-1.0, -2.0, 1, 1, 1, 1, 1)
+        self.assertNotEqual(initial_signature, canonical_signature)
+
+        learned_choices = (
+            (model.beta_logits, MODULE.BETA_VALUES.index(-1.0)),
+            (model.gamma_logits, MODULE.GAMMA_VALUES.index(-2.0)),
+            (model.branch_logits, 1),
+            (model.invert_modulus_logits, 1),
+            (model.reduction_carry_logits, 1),
+            (model.scan_direction_logits, 1),
+            (model.bit_gate_logits, 1),
+        )
         with torch.no_grad():
-            model.program_logits.fill_(-10.0)
-            model.program_logits[canonical[0]] = 10.0
+            for logits, choice in learned_choices:
+                logits.fill_(-10.0)
+                logits[choice] = 10.0
+        selected = int(model._program_log_weights().argmax())
+        learned_program = model._programs(torch.tensor([selected]))[0]
+        learned_controls = model._controls(torch.tensor([selected]))
+        learned_signature = (
+            float(learned_program[0]),
+            float(learned_program[1]),
+            int(learned_program[2]),
+            *(int(control[0]) for control in learned_controls),
+        )
+        self.assertEqual(learned_signature, canonical_signature)
         model.eval()
 
         modulus = 99_999_989
