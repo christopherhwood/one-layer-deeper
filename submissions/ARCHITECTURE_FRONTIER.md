@@ -36,6 +36,8 @@ few answers by chance.
 | directed neighborhood feedback | fixed current/next-significant classifiers | 0.08% | 15.35% | 10.50% | 16.28% | reject |
 | position-only predictor-corrector | detached residual logits + connected endpoint path | failed fixed smoke | — | — | — | reject after five ablations |
 | position-only sequence feedback | fixed whole-answer random code | 0.33% | 14.78% | 9.71% | 16.38% | fixed-only gain; reject |
+| product ripple + decoupled feedback | stop-gradient learned local classifier | 0.50% | **15.74%** | **11.58%** | 16.65% | broad short gain; 60s exact rejected |
+| product ripple + modulus consensus | symmetric gradients across disjoint modulus families | **0.79%** | 15.24% | 11.38% | **17.82%** | short OOD gain; 60s not durable |
 | Fourier numeric operator | learned periodic scalar basis | failed fixed smoke | — | — | — | reject |
 | untied Transformer | specialized depth/full gradients | failed fixed smoke | — | — | — | reject |
 
@@ -48,11 +50,14 @@ few answers by chance.
 | product attention, stop at 1,000 | 1,000 | 9.4% | 0.7% | 1.0% | 0.88% |
 | convolutional Neural GPU | 1,502 | 6.2% | 1.1% | 0.7% | 0.88% |
 | scaled general Transformer | 1,259 | 18.0% | 1.0% | 0.0% | 0.50% |
+| position-only product mixer (Hard) | 139,579 | 0.0% (1.6% max) | 0.0% | 0.0% | 0.03% |
 
-No candidate certifies seen or OOD-N T=1.  The H100 runs separate two failure
+No candidate certifies seen or OOD-N T=1.  The H100 runs separate three failure
 modes: general cellular recurrence cannot fit the variable task despite healthy
 throughput, while the larger Transformer and product model fit the finite
-training corpus but do not generalize.  More parameters and more repeated data
+training corpus but do not generalize. Position-only routing also cannot fit
+hidden Hard after 139,579 updates, decisively retiring it as a compute-scaling
+candidate. More parameters and more repeated data
 presentations are therefore not substitutes for more unique data, which the
 submission rules do not permit participants to create.
 
