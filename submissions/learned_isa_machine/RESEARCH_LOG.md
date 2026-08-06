@@ -62,11 +62,25 @@ Generic two-loop register machine; nothing arithmetic named in Python:
   weight by exact likelihood) — enumerable, marginalization-compatible.
 - Stage 2 needs (slot × table-dictionary) JOINT blocks (~37k alternatives).
 
+## Round 3a (COMPLETE): loss design for the squaring core is exhausted — NEGATIVE
+
+High-confidence negative across 5 credit designs (uniform, congruence, multiple-of-x
+ladder, CRT 17/19 decomposition, multi-T composition): every GA stalls at the same
+congruence wall 0.66-0.69. Mechanism: a partial double-and-add emits x·g(x) with g
+uncorrelated per row, so NO per-row functional of (x, N, y, output) can reward "half a
+multiplier"; multiple-of-x credit is itself a trivial attractor (constants are exact
+multiples; random init already scores 0.93). Basin check: greedy recovers the true core
+from k<=4 corrupted fields (7/8) — the basin exists; per-row-credit search cannot reach
+it. Conclusion: stop tuning the loss; change the search structure. (Affine solved in
+round 2 precisely because partial affine programs ARE visible to congruence credit.)
+
 ## In flight
 
-- Round 3a: credit ladder for the squaring core — multiple-of-x credit (any partial
-  double-and-add computes x·m; the loss can compute this from inputs alone), then
-  congruence, then exact; CRT credit as a science control.
 - Round 3b: affine stage-2 completion (joint slot×table-dict blocks from the stage-1
   winner; protected-core GA; existence check of reducer completions in the winner's
   neighborhood).
+- Round 4 (squaring core, search-structure levers): M1 quality-diversity (MAP-Elites
+  archive over behavior descriptors — stepping stones instead of fitness-only
+  selection); M2 MDL-ordered template enumeration with conditional per-entry table
+  best-response (brute-force the structure side, coordinate-learn tables given
+  structure; H100 feasibility estimate is a deliverable).
