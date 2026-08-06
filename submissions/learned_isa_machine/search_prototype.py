@@ -106,23 +106,63 @@ class Prog:
     pass
 
 
-def _scan(a, b, tid_off, ini, tv0, tv, rowidx):
-    """SCAN per spec. a, b: (., rows); tid_off: int (tid*8) or (A,1);
-    ini: int or (A,1); tv0: (32,) flat static tables or None;
-    tv: (A,32) per-alternative tables (used when rowidx is not None)."""
-    a2 = ((a.unsqueeze(0) >> SHIFTS) & 1) << 1     # (W, ., rows)
+_S0 = torch.zeros(1, 1, dtype=torch.long)
+_S1 = torch.ones(1, 1, dtype=torch.long)
+
+
+def _scan_static_core(a, b, tid_off, s0, tv0):
+    """SCAN with a single static table bank. All args tensors (tid_off 0-dim,
+    s0 (1,1) or (A,1)). Exact discrete recurrence; compilable."""
+    a2 = ((a.unsqueeze(0) >> SHIFTS) & 1) << 1
     b1 = (b.unsqueeze(0) >> SHIFTS) & 1
-    s = ini
-    out = 0
+    s = s0
+    out = None
     for pos in range(W):
         idx = s * 4 + a2[pos] + b1[pos] + tid_off
-        if rowidx is None:
-            val = tv0[idx]
-        else:
-            val = tv[rowidx, idx]
-        out = out + ((val & 1) << pos)
+        val = tv0[idx]
+        o = (val & 1) << pos
+        out = o if out is None else out + o
         s = val >> 1
     return out, s
+
+
+def _scan_alt_core(a, b, tid_off, s0, tv, rowidx):
+    """SCAN with per-alternative table banks tv (A,32); rowidx (A,1)."""
+    a2 = ((a.unsqueeze(0) >> SHIFTS) & 1) << 1
+    b1 = (b.unsqueeze(0) >> SHIFTS) & 1
+    s = s0
+    out = None
+    for pos in range(W):
+        idx = s * 4 + a2[pos] + b1[pos] + tid_off
+        val = tv[rowidx, idx]
+        o = (val & 1) << pos
+        out = o if out is None else out + o
+        s = val >> 1
+    return out, s
+
+
+SCAN_STATIC = _scan_static_core
+SCAN_ALT = _scan_alt_core
+
+
+def enable_compile():
+    global SCAN_STATIC, SCAN_ALT
+    try:
+        import torch._dynamo
+        torch._dynamo.config.cache_size_limit = 128
+        SCAN_STATIC = torch.compile(_scan_static_core, dynamic=True)
+        SCAN_ALT = torch.compile(_scan_alt_core, dynamic=True)
+        print("scan cores compiled (torch.compile, dynamic=True)")
+    except Exception as e:  # pragma: no cover
+        print("torch.compile unavailable, using eager scan cores:", e)
+
+
+def _scan(a, b, tid_off, ini, tv0, tv, rowidx):
+    """tid_off: 0-dim tensor (static tid*8) or (A,1) tensor; ini: tensor
+    (1,1)/(A,1); tv0 (32,) flat static tables; tv (A,32) per-alt tables."""
+    if rowidx is None:
+        return SCAN_STATIC(a, b, tid_off, ini, tv0)
+    return SCAN_ALT(a, b, tid_off, ini, tv, rowidx)
 
 
 def _read_operand(p, k, which, regs):
@@ -159,7 +199,12 @@ def _run_slot(p, k, regs, hb, phase):
     lm_mask = None if isinstance(lm, int) else p.lm_eq[k].get(phase)
     a = _read_operand(p, k, "sa", regs)
     b = _read_operand(p, k, "sb", regs)
-    r, term = _scan(a, b, p.tid_off[k], p.ini[k], p.tv0, p.tv, p.rowidx)
+    # normalize shapes so the compiled scan cores see one signature
+    if a.shape != p.full:
+        a = a.expand(p.full)
+    if b.shape != p.full:
+        b = b.expand(p.full)
+    r, term = _scan(a, b, p.tid_off[k], p.ini_t[k], p.tv0, p.tv, p.rowidx)
     prd = p.prd[k]
     if isinstance(prd, int):
         sp, pol = prd >> 1, prd & 1
@@ -202,6 +247,7 @@ def _run_slot(p, k, regs, hb, phase):
 def execute(p, x, trow, tmax):
     """Run the machine; returns latched outputs (A_or_1, rows) long."""
     rows = x.numel()
+    p.full = (p.A, rows)
     V = x.view(1, rows)
     NREG = torch.full((1, 1), N_MOD, dtype=torch.long)
     ZERO = torch.zeros(1, 1, dtype=torch.long)
@@ -227,7 +273,13 @@ def execute(p, x, trow, tmax):
 
 
 def _finalize(p):
-    p.tid_off = [t * 8 for t in p.tid]
+    A = p.A
+    p.tid_off = [
+        torch.full((A, 1), t * 8, dtype=torch.long) if isinstance(t, int)
+        else (t * 8).expand(A, 1) for t in p.tid]
+    p.ini_t = [
+        ((_S0 if t == 0 else _S1).expand(A, 1)) if isinstance(t, int)
+        else t.expand(A, 1) for t in p.ini]
     if p.tv.size(0) == 1:
         p.tv0, p.rowidx = p.tv[0], None
     else:
@@ -571,26 +623,38 @@ def eval_ctx(ctx, x, t, y):
 
 
 def train_run(fam, bp, seed, tag, log_dir, budget_updates=4000, budget_sec=480,
-              ctx_mode="map", tau0=1.0, curriculum=False, rows_per_update=0,
-              eval_every=50, lr=0.2, init_scale=0.1):
+              ctx_mode="map", tau0=1.0, tau_end=0.05, curriculum=False,
+              curr_frac=0.4, rows_per_update=0, eval_every=50, lr=0.2,
+              init_scale=0.1, nchains=NCHAINS, restart_after=0,
+              lsb_weight=False, compile_scan=False):
+    if compile_scan:
+        enable_compile()
     (xt, tt, yt), (xh, th, yh), (xo, to, yo) = gen_dataset(fam)
-    chains = [Chain(seed * 1000 + 17 * c + 1, init_scale=init_scale, lr=lr)
-              for c in range(NCHAINS)]
+    chain_seed = lambda ci, gen: seed * 1000 + 17 * ci + 1 + 100000 * gen  # noqa: E731
+    chains = [Chain(chain_seed(c, 0), init_scale=init_scale, lr=lr)
+              for c in range(nchains)]
     blocks = block_list()
     os.makedirs(log_dir, exist_ok=True)
     logf = open(os.path.join(log_dir, tag + ".jsonl"), "w")
     meta = dict(tag=tag, fam=fam, bp=bp, seed=seed, ctx_mode=ctx_mode,
-                tau0=tau0, curriculum=curriculum,
-                rows_per_update=rows_per_update, budget_updates=budget_updates,
-                budget_sec=budget_sec, lr=lr, init_scale=init_scale)
+                tau0=tau0, tau_end=tau_end, curriculum=curriculum,
+                curr_frac=curr_frac, rows_per_update=rows_per_update,
+                budget_updates=budget_updates, budget_sec=budget_sec, lr=lr,
+                init_scale=init_scale, nchains=nchains,
+                restart_after=restart_after, lsb_weight=lsb_weight,
+                compile_scan=compile_scan)
     logf.write(json.dumps({"meta": meta}) + "\n")
     print(f"=== run {tag}: {meta}")
     t0 = time.time()
     row_rng = torch.Generator().manual_seed(seed + 31337)
     t1_idx = (tt == 1).nonzero().view(-1)
+    wvec = (0.5 + torch.arange(W, dtype=torch.float32) / W).view(W, 1, 1)
     converged = None
     step = 0
     result = dict(meta=meta)
+    zero_since = [0] * nchains        # step at which chain last showed life
+    restart_gen = [0] * nchains
+    n_restarts = 0
 
     def metrics(step):
         ms = []
@@ -607,7 +671,7 @@ def train_run(fam, bp, seed, tag, log_dir, budget_updates=4000, budget_sec=480,
             break
         frac = max(step / max(budget_updates, 1), wall / max(budget_sec, 1))
         # row selection
-        if curriculum and frac < 0.5:
+        if curriculum and frac < curr_frac:
             idx = t1_idx
         else:
             idx = torch.arange(xt.numel())
@@ -617,14 +681,20 @@ def train_run(fam, bp, seed, tag, log_dir, budget_updates=4000, budget_sec=480,
         xb, tb, yb = xt[idx], tt[idx], yt[idx]
         tmax = int(tb.max())
         block = blocks[step % len(blocks)]
-        tau = tau0 * max(0.0, 1.0 - frac) if ctx_mode == "sample" else 0.0
+        tau = (tau_end + (tau0 - tau_end) * max(0.0, 1.0 - frac)
+               if ctx_mode == "sample" else 0.0)
         for ch in chains:
             ctx = ch.ctx(ctx_mode, tau)
             p, lp = build_prog(ctx, block, ch)
             with torch.no_grad():
                 out = execute(p, xb, tb, tmax)
-                mism = popcount(out ^ yb.view(1, -1)).sum(1)
-            loglik = mism.to(torch.float32) * (-float(bp))
+                diff = out ^ yb.view(1, -1)
+                if lsb_weight:
+                    bitmm = ((diff.unsqueeze(0) >> SHIFTS) & 1).to(torch.float32)
+                    mism = (bitmm * wvec).sum(0).sum(-1)
+                else:
+                    mism = popcount(diff).sum(-1).to(torch.float32)
+            loglik = mism * (-float(bp))
             loss = -torch.logsumexp(lp + loglik, 0)
             ch.opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -634,10 +704,12 @@ def train_run(fam, bp, seed, tag, log_dir, budget_updates=4000, budget_sec=480,
             wall = time.time() - t0
             ms = metrics(step)
             rec = dict(step=step, wall=round(wall, 1), metrics=ms,
-                       ups=round(step / max(wall, 1e-9), 2))
+                       ups=round(step / max(wall, 1e-9), 2),
+                       restarts=n_restarts, tau=round(tau, 3))
             logf.write(json.dumps(rec) + "\n")
             logf.flush()
-            print(f"[{tag}] step {step} wall {wall:.0f}s "
+            print(f"[{tag}] step {step} wall {wall:.0f}s ups="
+                  f"{step / max(wall, 1e-9):.1f} "
                   + " ".join(f"c{m['chain']}:tr={m['train']:.3f},he={m['held']:.3f}"
                              for m in ms))
             for m in ms:
@@ -647,6 +719,18 @@ def train_run(fam, bp, seed, tag, log_dir, budget_updates=4000, budget_sec=480,
                     break
             if converged:
                 break
+            if restart_after:
+                for ci, m in enumerate(ms):
+                    if m["train"] > 0.005:
+                        zero_since[ci] = step
+                    elif step - zero_since[ci] >= restart_after:
+                        restart_gen[ci] += 1
+                        n_restarts += 1
+                        chains[ci] = Chain(chain_seed(ci, restart_gen[ci]),
+                                           init_scale=init_scale, lr=lr)
+                        zero_since[ci] = step
+                        print(f"[{tag}] step {step}: restart chain {ci} "
+                              f"(gen {restart_gen[ci]})")
     wall = time.time() - t0
     ms = metrics(step)
     # OOD + decoded programs for converged/best chains
@@ -658,7 +742,7 @@ def train_run(fam, bp, seed, tag, log_dir, budget_updates=4000, budget_sec=480,
                            ood_t6=ood))
     best = max(finals, key=lambda m: (m["train"], m["held"]))
     result.update(converged=converged, steps=step, wall=round(wall, 1),
-                  finals=finals, best_chain=best["chain"])
+                  finals=finals, best_chain=best["chain"], restarts=n_restarts)
     decoded = {}
     for ci, ch in enumerate(chains):
         ctx = ch.ctx("map")
@@ -693,6 +777,7 @@ def main():
     b = sub.add_parser("bench")
     b.add_argument("--steps", type=int, default=33)
     b.add_argument("--rows", type=int, default=0)
+    b.add_argument("--compile", action="store_true")
     r = sub.add_parser("run")
     r.add_argument("--family", required=True, choices=list(FAMS))
     r.add_argument("--bp", type=float, required=True)
@@ -702,9 +787,15 @@ def main():
     r.add_argument("--budget-sec", type=float, default=480)
     r.add_argument("--ctx", default="map", choices=["map", "sample"])
     r.add_argument("--tau0", type=float, default=1.0)
+    r.add_argument("--tau-end", type=float, default=0.05)
     r.add_argument("--curriculum", action="store_true")
+    r.add_argument("--curr-frac", type=float, default=0.4)
     r.add_argument("--rows", type=int, default=0)
     r.add_argument("--eval-every", type=int, default=50)
+    r.add_argument("--nchains", type=int, default=NCHAINS)
+    r.add_argument("--restart-after", type=int, default=0)
+    r.add_argument("--lsb-weight", action="store_true")
+    r.add_argument("--compile", action="store_true")
     r.add_argument("--log-dir", default=os.environ.get(
         "PROTO_LOG_DIR", "/tmp/proto_logs"))
     args = ap.parse_args()
@@ -712,6 +803,8 @@ def main():
         ok = cross_check()
         sys.exit(0 if ok else 1)
     if args.cmd == "bench":
+        if getattr(args, "compile", False):
+            enable_compile()
         (xt, tt, yt), _, _ = gen_dataset("squaring")
         if args.rows:
             xt, tt, yt = xt[:args.rows], tt[:args.rows], yt[:args.rows]
@@ -740,8 +833,11 @@ def main():
         train_run(args.family, args.bp, args.seed, args.tag, args.log_dir,
                   budget_updates=args.budget_updates,
                   budget_sec=args.budget_sec, ctx_mode=args.ctx,
-                  tau0=args.tau0, curriculum=args.curriculum,
-                  rows_per_update=args.rows, eval_every=args.eval_every)
+                  tau0=args.tau0, tau_end=args.tau_end,
+                  curriculum=args.curriculum, curr_frac=args.curr_frac,
+                  rows_per_update=args.rows, eval_every=args.eval_every,
+                  nchains=args.nchains, restart_after=args.restart_after,
+                  lsb_weight=args.lsb_weight, compile_scan=args.compile)
 
 
 if __name__ == "__main__":
