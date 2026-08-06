@@ -235,6 +235,11 @@ python -m benchmark.runner \
   --submission-file submissions/baseline_adamw/submission.py
 ```
 
+For local research gates, add `--include-relaxed-metrics` to report aligned
+token accuracy, mean token errors per answer, within-one/two-token accuracy,
+and correct prefix/suffix fractions. These diagnostics do not change training,
+the official exact-match primary score, or certification.
+
 The smoke manifest creates its small dataset automatically. Before running a
 public Easy or Medium manifest, generate the full datasets referenced by those
 manifests:

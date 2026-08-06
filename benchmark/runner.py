@@ -224,6 +224,7 @@ def _loss_and_accuracy(
     *,
     training_loss=None,
     token_training_loss=None,
+    relaxed_totals: dict[str, float] | None = None,
 ) -> tuple[torch.Tensor, float, int, int]:
     input_ids, targets, attention_mask, target_positions = prepare_batch(
         batch,
@@ -297,6 +298,13 @@ def _loss_and_accuracy(
         ).all(dim=1)[rows_with_targets]
         example_count = int(rows_with_targets.sum().item())
         loss_weight = int(valid.sum().item())
+        if relaxed_totals is not None:
+            _accumulate_relaxed_metrics(
+                relaxed_totals,
+                token_predictions,
+                token_targets,
+                valid,
+            )
 
         if not torch.is_tensor(loss) or loss.ndim != 0:
             raise TypeError("training_loss must return one scalar tensor")
@@ -309,6 +317,86 @@ def _loss_and_accuracy(
 
     exact_accuracy = exact_rows.float().mean().item()
     return loss, exact_accuracy, example_count, loss_weight
+
+
+def _accumulate_relaxed_metrics(
+    totals: dict[str, float],
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    valid: torch.Tensor,
+) -> None:
+    """Accumulate alignment-only diagnostics without changing official score."""
+
+    rows = valid.any(dim=1)
+    valid = valid[rows]
+    predictions = predictions[rows]
+    targets = targets[rows]
+    correct = (predictions == targets) & valid
+    counts = valid.sum(dim=1)
+    correct_counts = correct.sum(dim=1)
+    errors = counts - correct_counts
+    rank = valid.long().cumsum(dim=1) - 1
+    first = valid & (rank == 0)
+    last = valid & (rank == counts[:, None] - 1)
+
+    prefix_open = ((~correct) & valid).long().cumsum(dim=1) == 0
+    prefix_counts = (correct & prefix_open).sum(dim=1)
+    reverse_wrong = torch.flip((~correct) & valid, dims=(1,))
+    suffix_open = torch.flip(
+        reverse_wrong.long().cumsum(dim=1) == 0,
+        dims=(1,),
+    )
+    suffix_counts = (correct & suffix_open).sum(dim=1)
+
+    totals["examples"] = totals.get("examples", 0.0) + float(rows.sum().item())
+    totals["tokens"] = totals.get("tokens", 0.0) + float(valid.sum().item())
+    totals["correct_tokens"] = totals.get("correct_tokens", 0.0) + float(
+        correct.sum().item()
+    )
+    totals["row_accuracy_sum"] = totals.get("row_accuracy_sum", 0.0) + float(
+        (correct_counts.float() / counts).sum().item()
+    )
+    totals["wrong_tokens"] = totals.get("wrong_tokens", 0.0) + float(
+        errors.sum().item()
+    )
+    totals["within_one"] = totals.get("within_one", 0.0) + float(
+        (errors <= 1).sum().item()
+    )
+    totals["within_two"] = totals.get("within_two", 0.0) + float(
+        (errors <= 2).sum().item()
+    )
+    totals["first_correct"] = totals.get("first_correct", 0.0) + float(
+        (correct & first).sum().item()
+    )
+    totals["last_correct"] = totals.get("last_correct", 0.0) + float(
+        (correct & last).sum().item()
+    )
+    totals["prefix_fraction_sum"] = totals.get(
+        "prefix_fraction_sum", 0.0
+    ) + float((prefix_counts.float() / counts).sum().item())
+    totals["suffix_fraction_sum"] = totals.get(
+        "suffix_fraction_sum", 0.0
+    ) + float((suffix_counts.float() / counts).sum().item())
+
+
+def _finalize_relaxed_metrics(totals: dict[str, float]) -> dict[str, float]:
+    examples = max(totals["examples"], 1.0)
+    tokens = max(totals["tokens"], 1.0)
+    return {
+        "token_accuracy": totals["correct_tokens"] / tokens,
+        "mean_row_token_accuracy": totals["row_accuracy_sum"] / examples,
+        "mean_wrong_tokens": totals["wrong_tokens"] / examples,
+        "within_one_token_accuracy": totals["within_one"] / examples,
+        "within_two_token_accuracy": totals["within_two"] / examples,
+        "first_token_accuracy": totals["first_correct"] / examples,
+        "last_token_accuracy": totals["last_correct"] / examples,
+        "mean_correct_prefix_fraction": (
+            totals["prefix_fraction_sum"] / examples
+        ),
+        "mean_correct_suffix_fraction": (
+            totals["suffix_fraction_sum"] / examples
+        ),
+    }
 
 
 def _train(
@@ -456,13 +544,17 @@ def _evaluate(
     *,
     deadline: float,
     budget_seconds: float,
-) -> dict[str, float]:
+    include_relaxed_metrics: bool = False,
+) -> dict[str, object]:
     model.eval()
     versions = capture_state_versions(model)
     loss_sum = 0.0
     correct_sum = 0.0
     example_count = 0
     loss_count = 0
+    relaxed_totals: dict[str, float] | None = (
+        {} if include_relaxed_metrics else None
+    )
     with torch.no_grad():
         for batch in dataloader:
             if time.monotonic() >= deadline:
@@ -470,7 +562,11 @@ def _evaluate(
                     f"evaluation exhausted its {budget_seconds:.1f}s time budget"
                 )
             loss, accuracy, batch_examples, batch_loss_weight = _loss_and_accuracy(
-                model, batch, manifest, device
+                model,
+                batch,
+                manifest,
+                device,
+                relaxed_totals=relaxed_totals,
             )
             if time.monotonic() >= deadline:
                 raise TimeoutError(
@@ -489,12 +585,15 @@ def _evaluate(
     if example_count == 0 or loss_count == 0:
         raise ValueError("evaluation split contains no labels")
     accuracy = correct_sum / example_count
-    return {
+    metrics = {
         "loss": loss_sum / loss_count,
         "exact_accuracy": accuracy,
         "correct_examples": int(round(correct_sum)),
         "example_count": example_count,
     }
+    if relaxed_totals is not None:
+        metrics["relaxed"] = _finalize_relaxed_metrics(relaxed_totals)
+    return metrics
 
 
 
@@ -509,6 +608,7 @@ def _evaluate_depth_profile(
     seed: int,
     prefix: str,
     label: str,
+    include_relaxed_metrics: bool = False,
 ) -> dict:
     split_names = _depth_split_names(dataloaders, prefix)
     ladder = [int(name.removeprefix(prefix)) for name in split_names]
@@ -525,6 +625,7 @@ def _evaluate_depth_profile(
                 device,
                 deadline=deadline,
                 budget_seconds=budget_seconds,
+                include_relaxed_metrics=include_relaxed_metrics,
             )
         except TimeoutError:
             rungs.append(
@@ -554,6 +655,11 @@ def _evaluate_depth_profile(
                 "correct_examples": metrics["correct_examples"],
                 "example_count": metrics["example_count"],
                 "exact_accuracy": metrics["exact_accuracy"],
+                **(
+                    {"relaxed": metrics["relaxed"]}
+                    if "relaxed" in metrics
+                    else {}
+                ),
             }
         )
         print(
@@ -562,6 +668,15 @@ def _evaluate_depth_profile(
             f"certified={prefix_solved}",
             flush=True,
         )
+        if "relaxed" in metrics:
+            relaxed = metrics["relaxed"]
+            print(
+                f"seed={seed} profile={label} depth_t={time_steps} "
+                f"token_accuracy={relaxed['token_accuracy']:.6f} "
+                f"within_one={relaxed['within_one_token_accuracy']:.6f} "
+                f"mean_wrong={relaxed['mean_wrong_tokens']:.6f}",
+                flush=True,
+            )
     return {
         "ladder": ladder,
         "max_certified_time_steps": max_certified_time_steps,
@@ -578,6 +693,7 @@ def _run_seed(
     submission_load_seconds: float,
     dataloaders=None,
     metric_recorder: MetricRecorder | None = None,
+    include_relaxed_metrics: bool = False,
 ) -> dict:
     _configure_seed(seed, device)
     batch_size, eval_batch_size = _resolve_batch_sizes(submission, manifest)
@@ -666,6 +782,7 @@ def _run_seed(
             device,
             deadline=evaluation_deadline,
             budget_seconds=evaluation_budget_seconds,
+            include_relaxed_metrics=include_relaxed_metrics,
         )
         evaluation[split_name] = metrics
         print(
@@ -673,6 +790,17 @@ def _run_seed(
             f"exact_accuracy={metrics['exact_accuracy']:.6f}",
             flush=True,
         )
+        if "relaxed" in metrics:
+            relaxed = metrics["relaxed"]
+            print(
+                f"seed={seed} split={split_name} "
+                f"token_accuracy={relaxed['token_accuracy']:.6f} "
+                f"within_one={relaxed['within_one_token_accuracy']:.6f} "
+                f"mean_wrong={relaxed['mean_wrong_tokens']:.6f} "
+                f"prefix={relaxed['mean_correct_prefix_fraction']:.6f} "
+                f"suffix={relaxed['mean_correct_suffix_fraction']:.6f}",
+                flush=True,
+            )
         if metric_recorder is not None:
             metric_recorder.record_evaluation(
                 seed=seed,
@@ -690,6 +818,7 @@ def _run_seed(
         seed=seed,
         prefix=DEPTH_SPLIT_PREFIX,
         label="seen_n",
+        include_relaxed_metrics=include_relaxed_metrics,
     )
     ood_n_depth_profile = _evaluate_depth_profile(
         model=model,
@@ -701,6 +830,7 @@ def _run_seed(
         seed=seed,
         prefix=OOD_N_DEPTH_SPLIT_PREFIX,
         label="ood_n",
+        include_relaxed_metrics=include_relaxed_metrics,
     )
     depth_profile.update(
         {
@@ -757,6 +887,7 @@ def run_submission_file(
     manifest_path: str | Path,
     *,
     include_structured_metrics: bool = False,
+    include_relaxed_metrics: bool = False,
 ) -> dict:
     manifest = load_manifest(manifest_path)
     device = _resolve_device(manifest)
@@ -814,6 +945,7 @@ def run_submission_file(
             submission_load_seconds / len(manifest.runtime.seeds),
             preloaded_dataloaders.get(seed),
             metric_recorder,
+            include_relaxed_metrics,
         )
         for seed in manifest.runtime.seeds
     ]
@@ -834,6 +966,14 @@ def run_submission_file(
         },
         "seeds": seed_results,
     }
+    if include_relaxed_metrics:
+        relaxed_keys = tuple(measurements[0]["relaxed"])
+        result["relaxed_score"] = {
+            key: statistics.fmean(
+                metrics["relaxed"][key] for metrics in measurements
+            )
+            for key in relaxed_keys
+        }
     if any(seed_result["depth_profile"]["ladder"] for seed_result in seed_results):
         certified_time_steps = min(
             seed_result["depth_profile"]["max_certified_time_steps"] or 0
@@ -879,11 +1019,13 @@ def cli() -> None:
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--submission-file", required=True)
     parser.add_argument("--include-structured-metrics", action="store_true")
+    parser.add_argument("--include-relaxed-metrics", action="store_true")
     args = parser.parse_args()
     run_submission_file(
         args.submission_file,
         args.manifest,
         include_structured_metrics=args.include_structured_metrics,
+        include_relaxed_metrics=args.include_relaxed_metrics,
     )
 
 
