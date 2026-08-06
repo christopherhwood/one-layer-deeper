@@ -1,0 +1,29 @@
+{
+  "name": "hidden-cube-cpu-local-60s",
+  "data": {
+    "kind": "squaring_mod",
+    "data_root": "/tmp/one-layer-hidden-cube",
+    "batch_size": 32,
+    "eval_batch_size": 256,
+    "shuffle_train": true,
+    "shuffle_eval": false,
+    "num_workers": 0,
+    "pin_memory": false,
+    "drop_last": true,
+    "seed": 45
+  },
+  "runtime": {
+    "device": "cpu",
+    "dtype": "float32",
+    "amp": false,
+    "compile": false,
+    "total_training_time_seconds": 60.0,
+    "max_steps": 1000000,
+    "seeds": [74],
+    "grad_clip": 1.0,
+    "log_every": 250
+  },
+  "model_state": {
+    "maximum_elements": 500000000
+  }
+}
