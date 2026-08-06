@@ -28,6 +28,8 @@ few answers by chance.
 | discrete serial + digit CRF | sequence-normalized serial endpoint | 0.75% | 14.44% | 10.38% | unavailable | 60s rejected |
 | anchored error-correcting ripple | discrete state corruption + tied repair pass | failed fixed smoke | — | — | — | reject |
 | position-only product mixer | content-independent relative routing | 0.29% | 15.06% | 10.75% | 16.07% | 60s OOD signal; H100 explore |
+| position-routed content gate | fixed routing + multiplicative local update | 0.38% | 14.99% | 9.42% | 16.07% | 60s rejected |
+| reversible product reducer | additive coupling inner recurrence | 0.42% | 14.98% | 9.79% | 17.18% | sample-efficient smoke; 60s rejected |
 | Fourier numeric operator | learned periodic scalar basis | failed fixed smoke | — | — | — | reject |
 | untied Transformer | specialized depth/full gradients | failed fixed smoke | — | — | — | reject |
 
