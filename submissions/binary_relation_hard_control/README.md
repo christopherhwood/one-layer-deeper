@@ -73,3 +73,65 @@ Relative to the seeded-particle control, factorization produced 47% more
 updates, cut evaluation by 8.1 seconds, and reduced model state by 85.5%, while
 preserving perfect endpoint and depth-profile behavior.  Most importantly, its
 deployed seed began with an incorrect complete MAP program.
+
+## Learned-microcode successor
+
+The current `submission.py` goes one level further.  It replaces the fixed
+double-and-add accumulator update with two learned instruction slots.  Each
+slot selects its right-hand register from `(accumulator, input, zero)`, and a
+four-way learned opcode commits the second slot never, on the current bit, on
+the inverse bit, or always.  Scan direction remains learned as well.
+
+The exact posterior now covers 20,160 coherent complete programs:
+
+`5 * 7 * 2 * 2 * 2 * 2` reducer/control choices times
+`3 * 3 * 4` microcode choices.
+
+The initial soft microcode relaxation failed at 4.3% exact, confirming that
+blending incompatible execution paths reintroduces stochastic shortcuts.  The
+exact discrete version starts from the wrong microprogram and reaches 100%
+test/OOD accuracy in only 21 updates in the 10-second CPU gate.  Seeds 0, 1, 2,
+and 74 all reach 100% in 21--26 updates.  It also passes the strict 0.05-second
+smoke, the max-width T=64 test, source validation, and all 165 repository tests.
+
+Its H100 M5 run, submission
+`5684f91d-b090-4985-a394-c331ecf9828d`, succeeded on 2026-08-06:
+
+- 9,000/9,000 test examples exact;
+- effectively 3,000/3,000 OOD examples exact;
+- all 768/768 examples certified at every seen- and unseen-modulus rung from
+  T=1 through T=64;
+- 1,011 updates in 600.2 training seconds;
+- 122.2 seconds of the 300-second evaluation budget;
+- 188,250 model-state and 13,633 optimizer-state elements.
+
+At inferred Hard width the source has 190,446 state elements.  Scaling the
+measured M5 evaluation by the private Hard example count and squared bit-width
+ratio predicts roughly 379 seconds, versus the 1,800-second Hard evaluation
+budget.
+
+### Current rule-7 boundary
+
+Learned from endpoints:
+
+- the two local finite-state relation coefficients;
+- carry-branch polarity;
+- modulus transform and reduction carry;
+- scan direction;
+- both accumulator instruction operands;
+- the second instruction's bit-conditioned commit opcode;
+- the global posterior selecting one shared complete program.
+
+Fixed architectural structure:
+
+- an observable binary tape and a two-state recurrent scan;
+- two generic scan passes per reducer instruction;
+- two accumulator instruction slots per input-bit step;
+- iteration of the learned square cell according to the input T.
+
+The untrained MAP program is wrong and low-accuracy, every instruction logit is
+randomly initialized and endpoint-trained, and final hard decoding reads only
+the executed state.  This is much closer to a learned finite-state interpreter
+than the earlier task solver.  The remaining semantic review risk is whether a
+two-pass reducer architecture itself is considered too task-specific under
+rule 7; the benchmark text does not define that boundary more precisely.

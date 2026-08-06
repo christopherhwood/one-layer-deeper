@@ -62,8 +62,9 @@ class BinaryRelationHardControlSubmissionTest(unittest.TestCase):
             float(initial_program[1]),
             int(initial_program[2]),
             *(int(control[0]) for control in initial_controls),
+            *(int(choice) for choice in model.microcode_choices[initial]),
         )
-        canonical_signature = (-1.0, -2.0, 1, 1, 1, 1, 1)
+        canonical_signature = (-1.0, -2.0, 1, 1, 1, 1, 1, 0, 1, 1)
         self.assertNotEqual(initial_signature, canonical_signature)
 
         learned_choices = (
@@ -73,7 +74,9 @@ class BinaryRelationHardControlSubmissionTest(unittest.TestCase):
             (model.invert_modulus_logits, 1),
             (model.reduction_carry_logits, 1),
             (model.scan_direction_logits, 1),
-            (model.bit_gate_logits, 1),
+            (model.slot1_rhs_logits, 0),
+            (model.slot2_rhs_logits, 1),
+            (model.commit_logits, 1),
         )
         with torch.no_grad():
             for logits, choice in learned_choices:
@@ -87,6 +90,7 @@ class BinaryRelationHardControlSubmissionTest(unittest.TestCase):
             float(learned_program[1]),
             int(learned_program[2]),
             *(int(control[0]) for control in learned_controls),
+            *(int(choice) for choice in model.microcode_choices[selected]),
         )
         self.assertEqual(learned_signature, canonical_signature)
         model.eval()

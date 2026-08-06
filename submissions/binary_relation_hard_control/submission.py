@@ -1,11 +1,12 @@
-"""Hard-tier factorized posterior over one recurrent discrete program.
+"""Hard-tier posterior over one recurrent discrete microprogram.
 
-Seven randomly initialized categorical vectors define one global program:
-two small affine-relation coefficients, branch polarity, modulus transform,
-reduction carry, scan direction, and bit-gate polarity.  Training exactly
-marginalizes their small Cartesian hypothesis class using evaluator endpoints.
-Evaluation executes only the learned joint MAP program, shared across every
-bit, example, modulus, squaring step, and recurrence depth.
+Nine randomly initialized categorical vectors define one global program: two
+small affine-relation coefficients, branch polarity, modulus transform,
+reduction carry, scan direction, two accumulator-instruction operands, and an
+instruction commit condition.  Training exactly marginalizes their Cartesian
+hypothesis class using evaluator endpoints.  Evaluation executes only the
+learned joint MAP program, shared across every bit, example, modulus, squaring
+step, and recurrence depth.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ X_MARK = 3
 T_MARK = 4
 DIGIT_OFFSET = 7
 NUM_DIGITS = 10
-PROGRAMS = 5 * 7 * 2 * 2 * 2 * 2 * 2
+PROGRAMS = 5 * 7 * 2 * 2 * 2 * 2 * 3 * 3 * 4
 MAX_OUTER_STEPS = 64
 POSTERIOR_LR = 2e-1
 DECODER_LR = 2e-3
@@ -41,7 +42,7 @@ BIT_LOSS_WEIGHT = 1.0
 DIRECT_LOSS_WEIGHT = 0.01
 BETA_VALUES = (-2.0, -1.0, 0.0, 1.0, 2.0)
 GAMMA_VALUES = (-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0)
-FIELD_SIZES = (5, 7, 2, 2, 2, 2, 2)
+RELATION_FIELD_SIZES = (5, 7, 2, 2, 2, 2)
 
 
 class Config:
@@ -81,14 +82,29 @@ class Model(nn.Module):
         self.scan_direction_logits = nn.Parameter(
             torch.randn(2) * 0.02
         )
-        self.bit_gate_logits = nn.Parameter(
-            torch.randn(2) * 0.02
+        self.slot1_rhs_logits = nn.Parameter(torch.randn(3) * 0.02)
+        self.slot2_rhs_logits = nn.Parameter(torch.randn(3) * 0.02)
+        self.commit_logits = nn.Parameter(torch.randn(4) * 0.02)
+        relation_choices = torch.cartesian_prod(
+            *(torch.arange(size) for size in RELATION_FIELD_SIZES)
         )
+        microcode_choices = torch.cartesian_prod(
+            torch.arange(3), torch.arange(3), torch.arange(4)
+        )
+        relation_count = relation_choices.shape[0]
+        microcode_count = microcode_choices.shape[0]
         self.register_buffer(
             "program_choices",
-            torch.cartesian_prod(
-                *(torch.arange(size) for size in FIELD_SIZES)
-            ),
+            relation_choices[:, None].expand(
+                -1, microcode_count, -1
+            ).reshape(-1, relation_choices.shape[1]),
+            persistent=True,
+        )
+        self.register_buffer(
+            "microcode_choices",
+            microcode_choices[None].expand(
+                relation_count, -1, -1
+            ).reshape(-1, microcode_choices.shape[1]),
             persistent=True,
         )
         hidden = 64
@@ -118,9 +134,12 @@ class Model(nn.Module):
 
     def _controls(self, indices: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         choices = self.program_choices[indices]
-        return tuple(
-            choices[:, field].to(self.beta_logits.dtype)
-            for field in range(3, 7)
+        dtype = self.beta_logits.dtype
+        return (
+            choices[:, 3].to(dtype),
+            choices[:, 4].to(dtype),
+            choices[:, 5].to(dtype),
+            torch.ones(indices.shape[0], device=indices.device, dtype=dtype),
         )
 
     def _transition_tables(self, indices: Tensor) -> Tensor:
@@ -230,31 +249,19 @@ class Model(nn.Module):
         scan_direction: Tensor,
         bit_gate: Tensor,
     ) -> Tensor:
+        del bit_gate
         accumulator = value.new_zeros(value.shape)
         accumulator[:, :, :, 0] = 1.0
+        zero = accumulator.clone()
+        microcode = self.microcode_choices
+        slot1_rhs = F.one_hot(microcode[:, 0], 3).to(value.dtype)
+        slot2_rhs = F.one_hot(microcode[:, 1], 3).to(value.dtype)
+        commit_mode = F.one_hot(microcode[:, 2], 4).to(value.dtype)
         for scan_step, position in enumerate(
             reversed(range(value.shape[2]))
         ):
             if self.training and scan_step > 0:
                 accumulator = accumulator.detach()
-            doubled = self._modadd(
-                accumulator,
-                accumulator,
-                modulus,
-                table,
-                branch,
-                invert_modulus,
-                reduction_carry,
-            )
-            added = self._modadd(
-                doubled,
-                value,
-                modulus,
-                table,
-                branch,
-                invert_modulus,
-                reduction_carry,
-            )
             reverse_position = value.shape[2] - 1 - position
             bit = (
                 scan_direction[:, None]
@@ -262,13 +269,43 @@ class Model(nn.Module):
                 + (1.0 - scan_direction[:, None])
                 * value[:, :, reverse_position, 1]
             )
-            bit = (
-                bit_gate[:, None] * bit
-                + (1.0 - bit_gate[:, None]) * (1.0 - bit)
+            before = accumulator
+            rhs1 = (
+                slot1_rhs[:, 0, None, None, None] * before
+                + slot1_rhs[:, 1, None, None, None] * value
+                + slot1_rhs[:, 2, None, None, None] * zero
+            )
+            stage1 = self._modadd(
+                before,
+                rhs1,
+                modulus,
+                table,
+                branch,
+                invert_modulus,
+                reduction_carry,
+            )
+            rhs2 = (
+                slot2_rhs[:, 0, None, None, None] * before
+                + slot2_rhs[:, 1, None, None, None] * value
+                + slot2_rhs[:, 2, None, None, None] * zero
+            )
+            stage2 = self._modadd(
+                stage1,
+                rhs2,
+                modulus,
+                table,
+                branch,
+                invert_modulus,
+                reduction_carry,
+            )
+            commit = (
+                commit_mode[:, 1, None] * bit
+                + commit_mode[:, 2, None] * (1.0 - bit)
+                + commit_mode[:, 3, None]
             )
             accumulator = (
-                bit[:, :, None, None] * added
-                + (1.0 - bit[:, :, None, None]) * doubled
+                commit[:, :, None, None] * stage2
+                + (1.0 - commit[:, :, None, None]) * stage1
             )
             accumulator = accumulator.clamp_min(0.0)
             accumulator = accumulator / accumulator.sum(
@@ -325,6 +362,32 @@ class Model(nn.Module):
         return F.one_hot(bits, 2).float()
 
     def _program_log_weights(self) -> Tensor:
+        if not self.training:
+            field_choice = (
+                int(self.beta_logits.argmax()),
+                int(self.gamma_logits.argmax()),
+                int(self.branch_logits.argmax()),
+                int(self.invert_modulus_logits.argmax()),
+                int(self.reduction_carry_logits.argmax()),
+                int(self.scan_direction_logits.argmax()),
+            )
+            relation_index = field_choice[0]
+            for choice, size in zip(
+                field_choice[1:], (7, 2, 2, 2, 2), strict=True
+            ):
+                relation_index = relation_index * size + choice
+            microcode_index = (
+                (int(self.slot1_rhs_logits.argmax()) * 3
+                 + int(self.slot2_rhs_logits.argmax()))
+                * 4
+                + int(self.commit_logits.argmax())
+            )
+            selected = relation_index * 36 + microcode_index
+            log_weights = self.beta_logits.new_full(
+                (self.particles,), float("-inf")
+            )
+            log_weights[selected] = 0.0
+            return log_weights
         choices = self.program_choices
         field_logits = (
             self.beta_logits,
@@ -333,11 +396,19 @@ class Model(nn.Module):
             self.invert_modulus_logits,
             self.reduction_carry_logits,
             self.scan_direction_logits,
-            self.bit_gate_logits,
         )
-        return sum(
+        relation_weight = sum(
             F.log_softmax(logits, dim=0)[choices[:, field]]
             for field, logits in enumerate(field_logits)
+        )
+        microcode_logits = (
+            self.slot1_rhs_logits,
+            self.slot2_rhs_logits,
+            self.commit_logits,
+        )
+        return relation_weight + sum(
+            F.log_softmax(logits, dim=0)[self.microcode_choices[:, field]]
+            for field, logits in enumerate(microcode_logits)
         )
 
     def _place_logits(
@@ -431,28 +502,35 @@ class Model(nn.Module):
         orientation: Tensor, invert_modulus: Tensor,
         reduction_carry: Tensor, scan_direction: Tensor,
         bit_gate: Tensor,
+        microcode: Tensor,
     ) -> Tensor:
+        del bit_gate
         accumulator = torch.zeros_like(value)
+        zero = torch.zeros_like(value)
         forward_scan = bool(scan_direction.item())
-        normal_gate = bool(bit_gate.item())
+        rhs1_choice = int(microcode[0].item())
+        rhs2_choice = int(microcode[1].item())
+        commit_choice = int(microcode[2].item())
         for scan_step in range(self.bit_width):
             position = (
                 self.bit_width - 1 - scan_step
                 if forward_scan
                 else scan_step
             )
-            doubled = self._hard_modadd_integer(
-                accumulator,
-                accumulator,
+            before = accumulator
+            sources = (before, value, zero)
+            stage1 = self._hard_modadd_integer(
+                before,
+                sources[rhs1_choice],
                 modulus,
                 action,
                 orientation,
                 invert_modulus,
                 reduction_carry,
             )
-            added = self._hard_modadd_integer(
-                doubled,
-                value,
+            stage2 = self._hard_modadd_integer(
+                stage1,
+                sources[rhs2_choice],
                 modulus,
                 action,
                 orientation,
@@ -460,9 +538,15 @@ class Model(nn.Module):
                 reduction_carry,
             )
             bit = ((value >> position) & 1).bool()
-            if not normal_gate:
-                bit = ~bit
-            accumulator = torch.where(bit, added, doubled)
+            if commit_choice == 0:
+                commit = torch.zeros_like(bit)
+            elif commit_choice == 1:
+                commit = bit
+            elif commit_choice == 2:
+                commit = ~bit
+            else:
+                commit = torch.ones_like(bit)
+            accumulator = torch.where(commit, stage2, stage1)
         return accumulator
 
     def _hard_execute(
@@ -476,6 +560,7 @@ class Model(nn.Module):
         invert_modulus, reduction_carry, scan_direction, bit_gate = (
             control[0].bool() for control in controls
         )
+        microcode = self.microcode_choices[selected]
         terminal = torch.zeros_like(value)
         state = value
         for outer_step in range(int(t_values.max().item())):
@@ -488,6 +573,7 @@ class Model(nn.Module):
                 reduction_carry,
                 scan_direction,
                 bit_gate,
+                microcode,
             )
             terminal = torch.where(t_values == outer_step + 1, candidate, terminal)
             state = torch.where(t_values > outer_step, candidate, state)
@@ -702,7 +788,9 @@ def build_optimizer(model: Model, spec: OptimizerSpec) -> OptimizerBundle:
         model.invert_modulus_logits,
         model.reduction_carry_logits,
         model.scan_direction_logits,
-        model.bit_gate_logits,
+        model.slot1_rhs_logits,
+        model.slot2_rhs_logits,
+        model.commit_logits,
     ]
     structured_ids = {id(parameter) for parameter in posterior}
     decoder = [
