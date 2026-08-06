@@ -35,6 +35,7 @@ few answers by chance.
 | position-only + decoupled feedback | stop-gradient feature/head local classifier | 0.25% | **15.67%** | 10.63% | 16.76% | best broad learner; 60s OOD rejected |
 | directed neighborhood feedback | fixed current/next-significant classifiers | 0.08% | 15.35% | 10.50% | 16.28% | reject |
 | position-only predictor-corrector | detached residual logits + connected endpoint path | failed fixed smoke | — | — | — | reject after five ablations |
+| position-only sequence feedback | fixed whole-answer random code | 0.33% | 14.78% | 9.71% | 16.38% | fixed-only gain; reject |
 | Fourier numeric operator | learned periodic scalar basis | failed fixed smoke | — | — | — | reject |
 | untied Transformer | specialized depth/full gradients | failed fixed smoke | — | — | — | reject |
 
