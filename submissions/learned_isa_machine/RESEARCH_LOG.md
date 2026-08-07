@@ -184,3 +184,21 @@ every GA_SEED in the multi-hundred-generation regime where round-4 odds approach
   selection); M2 MDL-ordered template enumeration with conditional per-entry table
   best-response (brute-force the structure side, coordinate-learn tables given
   structure; H100 feasibility estimate is a deliverable).
+
+## MILESTONE (2026-08-07): complete certified SQUARING program discovered
+
+Stage 1 (blinded structure enumeration, R=110, early-kill 0.65): true core ranked 1/2000
+at congruence 1.0 (~3,538 evals/structure mean, 75 restarts mean; 7.1M evals / 2,074s for
+the 2,000-structure shard set). The DETECTED core is double-and-add itself — ACC<-t(ACC,ACC)
+always + ACC<-t(ACC,V) if head-bit, head over V MSB-first — with tbl0 CONVERGING TO A FULL
+ADDER from random init. Stage 2 (tier-1 enumeration, 30,912 candidates, 599s): 30 complete
+programs; winner adds two ACC<-t1(ACC,N) if TERM- slots with tbl1 converging to a borrow
+table — textbook conditional-subtract reduction, rediscovered. Certified exact on all 323 x
+at T in {1,2,3,6}; width-robust (W=24, 30). Canonicalization (D2): raw 8.29M two-slot
+structures -> 132,616 canonical live classes (62.5x), so exhaustive stage-1 enumeration
+costs ~4.6e8 machine evals — inside H100 Hard budget, plausibly Medium.
+Artifacts: scratchpad sa_logs/round5_squaring_complete.txt, r5_d1_shard*.json, r5_d2_canon.json.
+
+All three recurrence families (affine, squaring, cube-expressible) now have validated
+discovery paths. Next: exhaustive-enumeration stage 1 in submission.py, local-runner proof
+on E1, then hosted Medium.
