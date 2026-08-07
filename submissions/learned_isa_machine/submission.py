@@ -158,16 +158,20 @@ def build_luts(tables: Tensor, ks: set[int] | None = None) -> dict[int, Tensor]:
         ks = {1, 2, 3, 4}
     luts = {1: tables.reshape(-1, 2, 4)}
     need = set(ks)
-    if 6 in need or 5 in need or 3 in need or 4 in need or 2 in need:
+    if need & {2, 3, 4, 5, 6, 7, 8}:
         luts[2] = _compose(luts[1], 1, luts[1], 1)
-    if 3 in need:
+    if need & {3, 7}:
         luts[3] = _compose(luts[2], 2, luts[1], 1)
-    if 4 in need or 5 in need or 6 in need:
+    if need & {4, 5, 6, 7, 8}:
         luts[4] = _compose(luts[2], 2, luts[2], 2)
     if 5 in need:
         luts[5] = _compose(luts[4], 4, luts[1], 1)
     if 6 in need:
         luts[6] = _compose(luts[4], 4, luts[2], 2)
+    if 7 in need:
+        luts[7] = _compose(luts[4], 4, luts[3], 3)
+    if 8 in need:
+        luts[8] = _compose(luts[4], 4, luts[4], 4)
     return {k: luts[k] for k in ks}
 
 
@@ -362,6 +366,127 @@ def execute_programs(
 
 
 # ---------------------------------------------------------------------------
+# Compiled single-program eval executor.  Semantics are exactly those of
+# execute_programs restricted to P=1, but the schedule (slot routing,
+# predicates, head registers) is resolved to Python scalars ONCE per eval
+# pass, so a batch costs only the unavoidable tensor ops: no per-batch
+# argmaxes, nonzero() syncs, or per-alternative bookkeeping.  This matters on
+# GPU, where every tiny kernel pays launch overhead and the depth ladder runs
+# up to T=64 outer steps per batch.
+# ---------------------------------------------------------------------------
+
+EVAL_MAX_K = 8  # wider LUT chunks at eval: fewer kernels per transducer scan
+
+
+def compile_eval_program(fields: Tensor, tables: Tensor) -> dict:
+    """Compile one program row (60 fields) into a static schedule.
+
+    NEVER slots are dropped outright.  HEAD_* predicates outside the head
+    segments resolve statically (the reference executor feeds them a constant
+    zero head bit): HEAD_POS never commits (drop), HEAD_NEG always commits.
+    Entries keep slot order inside each segment.
+    """
+    vals = [int(v) for v in fields.tolist()]
+    segments: list[list[tuple[int, int, int, int, int, int]]] = [
+        [] for _ in range(4)
+    ]
+    for i in range(K_SLOTS):
+        lm, dst, sa, sb, tid, ini, pr = vals[7 * i: 7 * i + 7]
+        if pr == PRED_NEVER:
+            continue
+        if lm in (LM_PRE, LM_POST):
+            if pr == PRED_HEAD_POS:
+                continue
+            if pr == PRED_HEAD_NEG:
+                pr = PRED_ALWAYS
+        segments[lm].append((4 + dst, sa, sb, tid, ini, pr))
+    heads = (
+        (HSRC_REG[vals[56]], vals[57] == 0),
+        (HSRC_REG[vals[58]], vals[59] == 0),
+    )
+    return {
+        "segments": segments,
+        "heads": heads,
+        "tables": tables.clone(),
+        "luts": {},
+        "device": tables.device,
+    }
+
+
+def run_eval_program(
+    prog: dict, xs: Tensor, ns: Tensor, ts: Tensor, width: int, t_max: int
+) -> Tensor:
+    device = xs.device
+    chunks = chunk_sizes(width, EVAL_MAX_K)
+    luts = prog["luts"]
+    missing = set(chunks) - luts.keys()
+    if missing:
+        built = build_luts(prog["tables"], missing)
+        for k in missing:
+            luts[k] = built[k].reshape(-1)
+    mask = (1 << width) - 1
+    rows = xs.numel()
+    zero = torch.zeros(rows, dtype=torch.long, device=device)
+    regs = [xs & mask, ns & mask, zero, zero + 1, zero, zero]
+
+    def run_entry(entry: tuple, head_bit: Tensor | None) -> None:
+        dst, sa, sb, tid, ini, pr = entry
+        a = regs[sa]
+        b = regs[sb]
+        state: int | Tensor = ini
+        out: Tensor | None = None
+        shift = 0
+        for k in chunks:
+            m = (1 << k) - 1
+            a_bits = (a >> shift) & m if shift else a & m
+            b_bits = (b >> shift) & m if shift else b & m
+            idx = ((tid * 2 + state) << (2 * k)) | (a_bits << k) | b_bits
+            val = torch.take(luts[k], idx)
+            piece = val >> 1
+            out = piece if shift == 0 else out | (piece << shift)
+            state = val & 1
+            shift += k
+        if pr == PRED_ALWAYS:
+            regs[dst] = out
+            return
+        if pr == PRED_HEAD_POS:
+            commit = head_bit == 1
+        elif pr == PRED_HEAD_NEG:
+            commit = head_bit == 0
+        elif pr == PRED_TERM_POS:
+            commit = state == 1
+        else:  # PRED_TERM_NEG
+            commit = state == 0
+        regs[dst] = torch.where(commit, out, regs[dst])
+
+    segments = prog["segments"]
+    latched = zero
+    for t_step in range(1, t_max + 1):
+        regs[4] = zero
+        regs[5] = zero
+        for entry in segments[LM_PRE]:
+            run_entry(entry, None)
+        for seg, (hreg, is_msb) in (
+            (LM_HEAD_A, prog["heads"][0]),
+            (LM_HEAD_B, prog["heads"][1]),
+        ):
+            entries = segments[seg]
+            if not entries:
+                continue
+            for head_it in range(width):
+                pos = width - 1 - head_it if is_msb else head_it
+                head_bit = (regs[hreg] >> pos) & 1 if pos else regs[hreg] & 1
+                for entry in entries:
+                    run_entry(entry, head_bit)
+        for entry in segments[LM_POST]:
+            run_entry(entry, None)
+        latched = torch.where(ts == t_step, regs[4], latched)
+        if t_step < t_max:
+            regs[0] = regs[4]
+    return latched
+
+
+# ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
 
@@ -420,6 +545,9 @@ class Model(nn.Module):
         }
         self._exec_rng = torch.Generator().manual_seed(GA_SEED + 1)
         self._lut_cache: LutCache | None = None
+        # eval-only compiled MAP program (plain attribute, never a buffer);
+        # rebuilt lazily after any training forward or device change
+        self._eval_cache: dict | None = None
 
     # -- parameter access ---------------------------------------------------
 
@@ -609,18 +737,22 @@ class Model(nn.Module):
 
         if not self.training:
             with torch.no_grad():
-                map_fields, map_tables = self.map_fields()
-                chain = int(self.best_chain)
-                out = execute_programs(
-                    map_fields[chain: chain + 1],
-                    torch.zeros(1, dtype=torch.long, device=input_ids.device),
-                    map_tables[chain: chain + 1],
-                    value, modulus, t_values, width, t_max, max_k=6,
-                )[0] & ((1 << width) - 1)
+                cache = self._eval_cache
+                if cache is None or cache["device"] != input_ids.device:
+                    map_fields, map_tables = self.map_fields()
+                    chain = int(self.best_chain)
+                    cache = compile_eval_program(
+                        map_fields[chain], map_tables[chain]
+                    )
+                    self._eval_cache = cache
+                out = run_eval_program(
+                    cache, value, modulus, t_values, width, t_max
+                ) & ((1 << width) - 1)
             digit_logits = self._decode_hard_integer(out, self.slot_lm.dtype)
             logits = self._place_logits(digit_logits, lengths, prompt)
             return logits, {"t_values": t_values}
 
+        self._eval_cache = None
         plan = self._plan
         with torch.no_grad():
             map_fields, map_tables = self.map_fields()
@@ -783,13 +915,15 @@ class Model(nn.Module):
                     ids[:, None] >> (2 * torch.arange(8, device=device))[None]
                 ) & 3
                 if shared_core:
+                    # sample on CPU: self._exec_rng is a CPU generator and
+                    # torch.multinomial rejects a generator/probs device split
                     probs = F.softmax(
                         self.table_ent[chain, t_free].detach(), dim=-1
-                    )
+                    ).cpu()
                     samples = torch.multinomial(
                         probs, SWEEP_POSTERIOR_SAMPLES, replacement=True,
                         generator=self._exec_rng,
-                    ).T  # (S, 8)
+                    ).T.to(device)  # (S, 8)
                     incumbent = (
                         self.table_ent[chain, t_free].detach().argmax(-1)
                     ).unsqueeze(0)
@@ -1011,14 +1145,17 @@ class Schedule:
         """tensor: (C, U, ...arity); donor_units: (V, U) donor chain per unit.
         Re-centers victims' logits on the donors' MAP values plus noise."""
         unit_axis = torch.arange(tensor.shape[1])
-        vals = tensor[donor_units, unit_axis].argmax(-1)      # (V, U, ...)
+        # noise is drawn on the CPU (self.rng is a CPU generator), so the
+        # donor MAP values must come to the CPU before the scatter, and the
+        # finished rows must go to the parameter's device before the write
+        vals = tensor[donor_units, unit_axis].argmax(-1).cpu()  # (V, U, ...)
         new = torch.randn(
             (victims.shape[0],) + tensor.shape[1:], generator=self.rng
         ) * NOISE
         new.scatter_(
             -1, vals.unsqueeze(-1), CONF, reduce="add"
         )
-        tensor[victims] = new.to(tensor.dtype)
+        tensor[victims] = new.to(device=tensor.device, dtype=tensor.dtype)
 
     def _mutate(self, chain: int) -> None:
         m = self.model
@@ -1084,8 +1221,14 @@ class Schedule:
                         ) * 0.05
                     m.slot_pred[chain, reserved, PRED_NEVER] += 1.0
             # selection uses the current batch's raw fitness (all chains are
-            # scored on the same rows every step, like a GA generation)
-            fitness = torch.where(m.stage == 1, 2.0 + m.fit_rows, m.last_fit)
+            # scored on the same rows every step, like a GA generation).
+            # GA bookkeeping happens on the CPU: the tournament picks are
+            # drawn from a CPU generator and torch.gather requires the index
+            # on the same device, so the fitness values come over once here
+            # (a no-op on CPU manifests).
+            fitness = torch.where(
+                m.stage == 1, 2.0 + m.fit_rows, m.last_fit
+            ).detach().cpu()
             order = fitness.argsort(descending=True)
 
             # cross-chain resampling (documented parameter transformation):
@@ -1146,7 +1289,9 @@ class Schedule:
                     m.slot_pred[
                         victims[:, None],
                         torch.tensor(RESERVED_SLOTS)[None, :],
-                    ] = pin_rows.to(m.slot_pred.dtype)
+                    ] = pin_rows.to(
+                        device=m.slot_pred.device, dtype=m.slot_pred.dtype
+                    )
                     m.fit_exact[victims] = 0.0
                     m.fit_rows[victims] = 0.0
                     m.last_rows[victims] = 0.0
@@ -1282,5 +1427,8 @@ SUBMISSION = Submission(
     build_optimizer=build_optimizer,
     token_training_loss=token_training_loss,
     batch_size=256,
-    eval_batch_size=256,
+    # eval cost is kernel-launch-bound and row-count independent, so larger
+    # eval batches directly cut depth-ladder wall time (512 rows per OOD rung
+    # -> one batch); matches the hosted manifest's own eval_batch_size
+    eval_batch_size=512,
 )
