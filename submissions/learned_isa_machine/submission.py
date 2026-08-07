@@ -80,6 +80,12 @@ TABLE_BLOCK_SAMPLES = 128
 SWEEP_TABLES_PER_STEP = 4096
 SWEEP_POSTERIOR_SAMPLES = 2048
 SWEEP_TABLES_FALLBACK = 256  # when no table is free, full programs are run
+# in-loop completion sweep (stage 2 for multiplicative cores: the reducer
+# must interleave the head loop; full-program execution, so smaller windows)
+LOOP_TABLES_PER_STEP = 2048
+LOOP_POSTERIOR_SAMPLES = 1024
+STAGE2_LOOP_START = 24  # stage-2 rotations before in-loop blocks join
+#                         (keeps the affine-validated once_post-first order)
 SWEEP_ROWS = 24
 FULL_T_ROWS = 64
 MAX_STAGE2_ACTIVE = 2
@@ -116,6 +122,145 @@ SWEEP_COMBOS[:, 3] += PRED_TERM_POS  # 0/1 -> TERM+/TERM-
 SWEEP_COMBOS = torch.cat(
     [SWEEP_COMBOS, torch.tensor([[0, 0, 0, PRED_NEVER]])], dim=0
 )
+
+# ---------------------------------------------------------------------------
+# Enumeration stage 1 (squaring-class cores): canonical two-active-slot
+# structure space + calibrated randomized steepest-descent table search.
+# All hyperparameters below come from the round-4/5 calibration; the visit
+# order is a fixed-seed permutation chosen a priori (answer-blind: it is a
+# function of the ISA alone, fixed before any structure was ever scored).
+# ---------------------------------------------------------------------------
+ENUM_ORDER_SEED = 20260807  # date constant, committed before any position math
+ENUM_MIN_BUDGET = 180.0     # below this budget the GA layer runs alone
+ENUM_TAIL_RESERVE = 180.0   # keep this much budget for stage 2 + polish
+ENUM_ROWS = 48              # rows per table-search evaluation (measured: 32
+#                             rows halve p_hit; 48 keep the round-5 basin)
+ENUM_MIN_ROWS = 16
+ENUM_RESTARTS_A = 12        # phase-A screen restarts (p_hit/restart ~0.038)
+ENUM_RESTARTS_CAP = 110     # calibrated full refinement (detection ~0.985)
+ENUM_RESTART_LADDER = (110, 90, 70, 50, 40, 30)
+ENUM_KILL = 0.62            # early-kill: P(true best-of-12 < 0.62) ~ 1e-3,
+#                             junk survivor fraction ~0.38 (measured, 48 rows)
+ENUM_KILL_SMALL = 0.60      # when fewer than 32 rows are available
+ENUM_MAX_WALK = 12          # steepest-descent move cap per restart
+ENUM_P_CAP = 6144           # programs per executor call (CPU cache sweet spot)
+ENUM_P_CAP_CUDA = 65536     # H100: launch-bound, so bigger calls win
+ENUM_CHUNK0 = 4
+ENUM_CHUNK_MAX = 512        # structures per step (CPU)
+ENUM_CHUNK_MAX_CUDA = 4096
+ENUM_STUCK_STEPS = 160      # stage-2 steps without exactness before resuming
+#                             (covers the full in-loop sweep window rotation)
+# cost model used only to pick the restart count from the wall clock:
+# evals/structure ~ EVA + survivor_frac * (R - RESTARTS_A) * EVR
+ENUM_EVA = 710.0
+ENUM_EVR = 65.0
+
+
+def build_enum_space() -> Tensor:
+    """Canonical live two-active-slot structure space, (M, 14) long rows
+    (lm0,dst0,sb0,ini0,pr0, lm1,dst1,sb1,ini1,pr1, hAs,hAd,hBs,hBd).
+
+    Data-free port of the round-5 D2 canonicalization of the raw
+    480*480*36 = 8,294,400 two-slot space (M = 132,616):
+      - per-slot configs exclude predicate NEVER; once-segment HEAD_POS
+        slots are NOPs (excluded; lower tier), once-segment HEAD_NEG
+        collapses to ALWAYS;
+      - swap-safe slot orders (different segments, or same-segment writes
+        to different registers with no cross-read) are collapsed to one
+        representative order; swap-unsafe pairs keep both orders;
+      - head configs are enumerated only for heads actually read by a
+        head-segment slot with a HEAD_* predicate; unread heads are pinned
+        to (V, MSB);
+      - pairs where either slot cannot influence the ACC output are
+        dropped (conservative liveness: the slot writes ACC, or a path to
+        ACC exists through the other slot via an S1 read or an S1-sourced
+        head that is re-read at/after the writer's segment).
+    """
+    configs = []
+    for lm in range(N_LM):
+        if lm in (LM_PRE, LM_POST):
+            preds = (PRED_ALWAYS, PRED_TERM_POS, PRED_TERM_NEG)
+        else:
+            preds = (PRED_ALWAYS, PRED_HEAD_POS, PRED_HEAD_NEG,
+                     PRED_TERM_POS, PRED_TERM_NEG)
+        for dst in range(N_DST):
+            for sb in range(N_SRC):
+                for ini in range(N_INI):
+                    for pr in preds:
+                        configs.append((lm, dst, sb, ini, pr))
+    cfg = torch.tensor(configs, dtype=torch.long)  # (K, 5)
+    k_cls = cfg.shape[0]
+    lm, dst, sb, pr = cfg[:, 0], cfg[:, 1], cfg[:, 2], cfg[:, 4]
+    in_head = (lm == LM_HEAD_A) | (lm == LM_HEAD_B)
+    reads = ((pr == PRED_HEAD_POS) | (pr == PRED_HEAD_NEG)) & in_head
+    head_of = torch.where(reads, lm, torch.zeros_like(lm))  # 0 / 1(A) / 2(B)
+
+    a = torch.arange(k_cls).repeat_interleave(k_cls)
+    b = torch.arange(k_cls).repeat(k_cls)
+    reg = 4 + dst  # dst register as a src_b code (ACC=4, S1=5)
+    safe = (
+        (lm[a] != lm[b])
+        | ((dst[a] != dst[b]) & (sb[a] != reg[b]) & (sb[b] != reg[a]))
+        | (a == b)
+    )
+    order_ok = (a <= b) | ~safe
+    once = ~in_head
+    # path to ACC for an S1-writing slot via the other slot's S1 read;
+    # slot0 executes first inside a shared once segment
+    p1_0 = (sb[b] == 5) & (
+        (lm[b] > lm[a])
+        | ((lm[b] == lm[a]) & in_head[a])
+        | ((lm[b] == lm[a]) & once[a])
+    )
+    p1_1 = (sb[a] == 5) & (
+        (lm[a] > lm[b]) | ((lm[a] == lm[b]) & in_head[b])
+    )
+    # path via the other slot's head predicate when that head reads S1
+    # (head bits are re-read every iteration at/after the writer's segment)
+    oh_a, oh_b = head_of[a], head_of[b]
+    p2_0_a = (oh_b == 1) & (lm[a] <= 1)
+    p2_0_b = (oh_b == 2) & (lm[a] <= 2)
+    p2_1_a = (oh_a == 1) & (lm[b] <= 1)
+    p2_1_b = (oh_a == 2) & (lm[b] <= 2)
+    live0_base = (dst[a] == 0) | p1_0
+    live1_base = (dst[b] == 0) | p1_1
+    need_a = (oh_a == 1) | (oh_b == 1)
+    need_b = (oh_a == 2) | (oh_b == 2)
+    # 36 head combos: c = (hAs*2 + hAd)*6 + (hBs*2 + hBd)
+    c36 = torch.arange(36)
+    h_as, h_ad = c36 // 12, (c36 // 6) % 2
+    h_bs, h_bd = (c36 % 6) // 2, c36 % 2
+    ha_pin = (h_as == 0) & (h_ad == 0)
+    hb_pin = (h_bs == 0) & (h_bd == 0)
+    ha_s1 = h_as == 2
+    hb_s1 = h_bs == 2
+    valid = (need_a[:, None] | ha_pin[None, :]) & (
+        need_b[:, None] | hb_pin[None, :]
+    )
+    live0 = (
+        live0_base[:, None]
+        | (p2_0_a[:, None] & ha_s1[None, :])
+        | (p2_0_b[:, None] & hb_s1[None, :])
+    )
+    live1 = (
+        live1_base[:, None]
+        | (p2_1_a[:, None] & ha_s1[None, :])
+        | (p2_1_b[:, None] & hb_s1[None, :])
+    )
+    keep = order_ok[:, None] & valid & live0 & live1
+    pair_idx, combo_idx = keep.nonzero(as_tuple=True)
+    return torch.cat(
+        [
+            cfg[a[pair_idx]],
+            cfg[b[pair_idx]],
+            torch.stack(
+                [h_as[combo_idx], h_ad[combo_idx],
+                 h_bs[combo_idx], h_bd[combo_idx]],
+                dim=1,
+            ),
+        ],
+        dim=1,
+    )
 
 
 class Config:
@@ -276,7 +421,7 @@ def execute_programs(
             if sub.numel() == 0:
                 continue
             sc = slot_cols[sub, i]
-            lidx = tset[sub] * 4 + sc[:, 4]
+            lidx = tset[sub] * bank.shape[1] + sc[:, 4]
             plans[seg].append((
                 sub,
                 (sc[:, 1] == 0).unsqueeze(1),  # dst is ACC
@@ -545,6 +690,31 @@ class Model(nn.Module):
         }
         self._exec_rng = torch.Generator().manual_seed(GA_SEED + 1)
         self._lut_cache: LutCache | None = None
+        # enumeration stage-1 state.  The canonical structure list is a
+        # deterministic function of the ISA (no data); it is rebuilt on
+        # demand rather than stored as model state.  Findings live in the
+        # persistent scheduler buffers below.
+        self._enum_structs: Tensor | None = None
+        self._enum_order: Tensor | None = None
+        self._enum_rng = torch.Generator().manual_seed(GA_SEED + 7)
+        self._enum_eval_acc = 0
+        self.register_buffer("enum_cursor", torch.zeros((), dtype=torch.long), persistent=True)
+        self.register_buffer("enum_done", torch.zeros(()), persistent=True)
+        self.register_buffer("enum_surv", torch.zeros(()), persistent=True)
+        self.register_buffer("enum_evals", torch.zeros(()), persistent=True)
+        self.register_buffer("enum_secs", torch.zeros(()), persistent=True)
+        self.register_buffer("enum_best_cong", torch.zeros(()), persistent=True)
+        self.register_buffer("enum_best_pos", torch.zeros((), dtype=torch.long), persistent=True)
+        self.register_buffer("enum_hits", torch.zeros((), dtype=torch.long), persistent=True)
+        self.register_buffer("enum_hit_pos", torch.zeros((), dtype=torch.long), persistent=True)
+        self.register_buffer("enum_prog", torch.zeros(60, dtype=torch.long), persistent=True)
+        self.register_buffer("enum_tab", torch.zeros(8, dtype=torch.long), persistent=True)
+        # stage-2 in-loop completion findings (recorded by the loss when a
+        # row-exact completion candidate is scored; adopted by the scheduler)
+        self.register_buffer("s2_hit", torch.zeros((), dtype=torch.long), persistent=True)
+        self.register_buffer("s2_chain", torch.zeros((), dtype=torch.long), persistent=True)
+        self.register_buffer("s2_prog", torch.zeros(60, dtype=torch.long), persistent=True)
+        self.register_buffer("s2_bank", torch.zeros(N_TID, 8, dtype=torch.long), persistent=True)
         # eval-only compiled MAP program (plain attribute, never a buffer);
         # rebuilt lazily after any training forward or device change
         self._eval_cache: dict | None = None
@@ -784,7 +954,7 @@ class Model(nn.Module):
         cursor = NCHAINS
         sweeps: list[tuple[int, tuple]] = []
         for chain, block in plan["active"]:
-            if block[0] in ("sweep", "comp"):
+            if block[0] in ("sweep", "comp", "loop"):
                 sweeps.append((chain, block))
                 continue
             fields, tset, extra, log_prior = self._block_alternatives(
@@ -830,12 +1000,19 @@ class Model(nn.Module):
                 alt_outs.append(out)
                 spans.append((-1, -1))
                 continue
+            if block[0] == "loop":
+                lp_l, out_l, xs_l, ns_l, pack = self._loop_sweep(
+                    chain, map_fields, map_tables,
+                    value_e[t1_sel], modulus_e[t1_sel], width, plan,
+                )
+                sweep_terms.append((lp_l, out_l, xs_l, ns_l, t1_sel, pack))
+                continue
             sweep_terms.append(
                 self._completion_sweep(
                     chain, block, map_fields, map_tables,
                     value_e[t1_sel], modulus_e[t1_sel], width, plan,
                 )
-                + (t1_sel,)
+                + (t1_sel, None)
             )
 
         # soft decoder on the best chain's latched outputs (training path only)
@@ -858,6 +1035,7 @@ class Model(nn.Module):
             "log_priors": log_priors,
             "sweep_terms": sweep_terms,
             "sel": sel,
+            "value": value_e,
             "modulus": modulus_e,
             "t_values": t_e,
             "width": width,
@@ -1008,6 +1186,387 @@ class Model(nn.Module):
         log_prior = (lp_combo[:, None] + lp_pattern[None, :]).reshape(-1)
         return log_prior, result, xs, ns
 
+    def _loop_sweep(
+        self,
+        chain: int,
+        map_fields: Tensor,
+        map_tables: Tensor,
+        xs: Tensor,
+        ns: Tensor,
+        width: int,
+        plan: dict,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Stage-2 IN-LOOP completion block.
+
+        A once_post subtract cannot reduce a multiplicative core (its
+        unreduced output spans hundreds of multiples of N); the reducer must
+        interleave the accumulation loop itself.  This block enumerates
+        conditional completions of the reserved slots placed INSIDE the
+        core's own head segment -- (init, TERM polarity, single-or-pair)
+        placements of ACC<-t(ACC, N), trailing the core slots each head
+        iteration -- jointly with the ENTRY patterns of a free table
+        (rotating 2048-window over all 65,536 + posterior samples +
+        incumbent).  The trailing (pr=NEVER) combo row is the explicit
+        no-op anchor.  Execution is full-program and discrete: the
+        shared-core shortcut is invalid inside the loop."""
+        device = xs.device
+        with torch.no_grad():
+            core = map_fields[chain].clone()
+            for reserved in RESERVED_SLOTS:
+                core[7 * reserved + 6] = PRED_NEVER
+            segs = sorted(
+                int(core[7 * i])
+                for i in range(K_SLOTS)
+                if int(core[7 * i + 6]) != PRED_NEVER
+                and int(core[7 * i]) in (LM_HEAD_A, LM_HEAD_B)
+            )
+            if not segs:
+                # once-only core: fall back to the once_post entry sweep
+                return self._completion_sweep(
+                    chain, ("sweep", RESERVED_SLOTS[0]),
+                    map_fields, map_tables, xs, ns, width, plan,
+                ) + (None,)
+            seg = segs[0]
+            used = {
+                int(core[7 * i + 4]) for i in range(K_SLOTS)
+                if int(core[7 * i + 6]) != PRED_NEVER
+            }
+            free_tables = [t for t in range(N_TID) if t not in used]
+            t_free = free_tables[0] if free_tables else N_TID - 1
+            n_win = (
+                LOOP_TABLES_PER_STEP if free_tables else SWEEP_TABLES_FALLBACK
+            )
+            lo = plan.get("loop_lo", 0)
+            ids = (lo + torch.arange(n_win, device=device)) % 65536
+            window = (
+                ids[:, None] >> (2 * torch.arange(8, device=device))[None]
+            ) & 3
+            if free_tables:
+                probs = F.softmax(
+                    self.table_ent[chain, t_free].detach(), dim=-1
+                ).cpu()
+                samples = torch.multinomial(
+                    probs, LOOP_POSTERIOR_SAMPLES, replacement=True,
+                    generator=self._exec_rng,
+                ).T.to(device)
+                incumbent = (
+                    self.table_ent[chain, t_free].detach().argmax(-1)
+                ).unsqueeze(0)
+                tables = torch.cat([window, samples, incumbent], dim=0)
+            else:
+                tables = window
+            n_pat = tables.shape[0]
+            combos = [
+                (ini, pr, pair)
+                for ini in range(N_INI)
+                for pr in (PRED_TERM_POS, PRED_TERM_NEG)
+                for pair in (0, 1)
+            ] + [(0, PRED_NEVER, 0)]
+            n_combo = len(combos)
+            fields = core.unsqueeze(0).repeat(n_combo * n_pat, 1)
+            for ci, (ini, pr, pair) in enumerate(combos):
+                if pr == PRED_NEVER:
+                    continue
+                sel = slice(ci * n_pat, (ci + 1) * n_pat)
+                for si, slot in enumerate(RESERVED_SLOTS):
+                    if si == 1 and not pair:
+                        continue
+                    col = 7 * slot
+                    fields[sel, col + 0] = seg
+                    fields[sel, col + 1] = 0  # dst = ACC
+                    fields[sel, col + 2] = 4
+                    fields[sel, col + 3] = 1  # src_b = N
+                    fields[sel, col + 4] = t_free
+                    fields[sel, col + 5] = ini
+                    fields[sel, col + 6] = pr
+            bank = map_tables[chain].unsqueeze(0).repeat(n_pat, 1, 1)
+            bank[:, t_free] = tables
+            tset = torch.arange(n_pat, device=device).repeat(n_combo)
+            result = execute_programs(
+                fields, tset, bank, xs, ns, torch.ones_like(xs), width, 1,
+            )
+        self._loop_debug = (seg, combos, tables, t_free, bool(free_tables))
+        ls = lambda t: F.log_softmax(t, dim=-1)  # noqa: E731
+        s6, s7 = RESERVED_SLOTS
+        lp_rows = []
+        for ini, pr, pair in combos:
+            lp = ls(self.slot_pred[chain, s6])[pr]
+            if pr != PRED_NEVER:
+                lp = (
+                    lp
+                    + ls(self.slot_lm[chain, s6])[seg]
+                    + ls(self.slot_dst[chain, s6])[0]
+                    + ls(self.slot_sb[chain, s6])[1]
+                    + ls(self.slot_tid[chain, s6])[t_free]
+                    + ls(self.slot_ini[chain, s6])[ini]
+                )
+            if pair:
+                lp = (
+                    lp
+                    + ls(self.slot_pred[chain, s7])[pr]
+                    + ls(self.slot_lm[chain, s7])[seg]
+                    + ls(self.slot_dst[chain, s7])[0]
+                    + ls(self.slot_sb[chain, s7])[1]
+                    + ls(self.slot_tid[chain, s7])[t_free]
+                    + ls(self.slot_ini[chain, s7])[ini]
+                )
+            else:
+                lp = lp + ls(self.slot_pred[chain, s7])[PRED_NEVER]
+            lp_rows.append(lp)
+        lp_combo = torch.stack(lp_rows)  # (n_combo,)
+        if free_tables:
+            entry_lp = ls(self.table_ent[chain, t_free])  # (8, 4)
+            lp_pattern = entry_lp[
+                torch.arange(8, device=device)[None, :], tables
+            ].sum(-1)
+        else:
+            lp_pattern = torch.zeros(
+                n_pat, device=device, dtype=lp_combo.dtype
+            )
+        log_prior = (lp_combo[:, None] + lp_pattern[None, :]).reshape(-1)
+        # candidate pack: lets the loss record a row-exact completion in the
+        # scheduler buffers (the gradient flip alone is fragile under global
+        # grad clipping with windows that rotate every step)
+        pack = (fields, tset, bank, chain)
+        return log_prior, result, xs, ns, pack
+
+    # -- enumeration stage 1 --------------------------------------------------
+
+    def _enum_space_init(self) -> float:
+        """Build the canonical structure list + the fixed-seed visit order."""
+        if self._enum_structs is not None:
+            return 0.0
+        start = time.monotonic()
+        device = self.slot_lm.device
+        structs = build_enum_space().to(device)
+        order = torch.randperm(
+            structs.shape[0],
+            generator=torch.Generator().manual_seed(ENUM_ORDER_SEED),
+        ).to(device)
+        self._enum_structs = structs
+        self._enum_order = order
+        return time.monotonic() - start
+
+    def _enum_fields(self, st: Tensor) -> Tensor:
+        """(P, 14) structure rows -> (P, 60) genomes (slots 0-1, table 0)."""
+        p_total = st.shape[0]
+        fields = torch.zeros(p_total, 60, dtype=torch.long, device=st.device)
+        for i in range(K_SLOTS):
+            fields[:, 7 * i + 6] = PRED_NEVER
+        for k in (0, 1):
+            col, s = 7 * k, 5 * k
+            fields[:, col + 0] = st[:, s + 0]
+            fields[:, col + 1] = st[:, s + 1]
+            fields[:, col + 2] = 4 + st[:, s + 1]
+            fields[:, col + 3] = st[:, s + 2]
+            fields[:, col + 5] = st[:, s + 3]
+            fields[:, col + 6] = st[:, s + 4]
+        fields[:, 56:60] = st[:, 10:14]
+        return fields
+
+    def _enum_execute(
+        self, fields: Tensor, tables: Tensor, xs: Tensor, ns: Tensor, width: int
+    ) -> Tensor:
+        """Discrete execution of (program, its-own-table) rows at T=1."""
+        p_total = fields.shape[0]
+        cap = ENUM_P_CAP if fields.device.type == "cpu" else ENUM_P_CAP_CUDA
+        outs = []
+        for lo in range(0, p_total, cap):
+            f = fields[lo: lo + cap]
+            t = tables[lo: lo + cap]
+            outs.append(
+                execute_programs(
+                    f,
+                    torch.arange(f.shape[0], device=f.device),
+                    t.unsqueeze(1),
+                    xs, ns, torch.ones_like(xs), width, 1,
+                )
+            )
+        self._enum_eval_acc += p_total
+        return outs[0] if len(outs) == 1 else torch.cat(outs)
+
+    def _enum_score(
+        self, out: Tensor, y: Tensor, ns: Tensor, width: int
+    ) -> tuple[Tensor, Tensor]:
+        """(congruence bit-match, walk move score) per program.
+
+        The walk moves on the congruence component alone -- exactly the
+        round-5-calibrated table learner.  (Measured: adding the range bonus
+        to the MOVE score collapses p_hit from 4.4% to 1.0% per restart,
+        because the constant-zero attractor is always "in range".  The full
+        stage-1 credit, range bonus included, still scores the finalists in
+        the loss marginal.)"""
+        mask = (1 << width) - 1
+        w_low = int(ns.max()).bit_length() + 1
+        cong = _bit_match((out.remainder(ns[None, :]) ^ y[None, :]) & mask, w_low)
+        return cong, cong
+
+    def _enum_steepest(
+        self, fields: Tensor, tables: Tensor,
+        xs: Tensor, ns: Tensor, y: Tensor, width: int,
+    ) -> tuple[Tensor, Tensor]:
+        """Randomized steepest descent over single table entries: each walker
+        moves to the best of its 24 one-entry neighbors while that strictly
+        improves the stage-1 credit (the round-5 calibrated table learner),
+        batched across all walkers."""
+        device = fields.device
+        tables = tables.clone()
+        n_walk = tables.shape[0]
+        out = self._enum_execute(fields, tables, xs, ns, width)
+        cong, score = self._enum_score(out, y, ns, width)
+        alive = torch.ones(n_walk, dtype=torch.bool, device=device)
+        pat_e = torch.arange(8, device=device).repeat_interleave(3)  # (24,)
+        alt = torch.arange(24, device=device) % 3
+        for _ in range(ENUM_MAX_WALK):
+            idx = alive.nonzero(as_tuple=False).flatten()
+            if idx.numel() == 0:
+                break
+            na = idx.numel()
+            cand_f = fields.index_select(0, idx).repeat_interleave(24, dim=0)
+            cand_t = tables.index_select(0, idx).repeat_interleave(24, dim=0)
+            e_col = pat_e.repeat(na).unsqueeze(1)
+            cur = cand_t.gather(1, e_col).squeeze(1)
+            new_v = alt.repeat(na)
+            new_v = new_v + (new_v >= cur).long()
+            cand_t.scatter_(1, e_col, new_v.unsqueeze(1))
+            o = self._enum_execute(cand_f, cand_t, xs, ns, width)
+            c_nb, s_nb = self._enum_score(o, y, ns, width)
+            s_nb = s_nb.view(na, 24)
+            j = s_nb.argmax(dim=1)
+            best = s_nb.gather(1, j.unsqueeze(1)).squeeze(1)
+            impr = best > score[idx] + 1e-12
+            up = idx[impr]
+            if up.numel():
+                rows = impr.nonzero(as_tuple=False).flatten()
+                tables[up] = cand_t[rows * 24 + j[rows]]
+                score[up] = best[impr]
+                cong[up] = c_nb.view(na, 24)[rows, j[rows]]
+            alive[idx[~impr]] = False
+        return tables, cong
+
+    def _enum_chunk(
+        self, xs: Tensor, ns: Tensor, y: Tensor, width: int,
+        n: int, restarts_total: int,
+    ) -> dict | None:
+        """Advance the enumeration cursor over the next n structures.
+
+        Phase A screens ENUM_RESTARTS_A steepest restarts per structure and
+        early-kills structures whose best congruence stays below the
+        calibrated threshold; survivors get restarts up to restarts_total.
+        Verified congruence-exact finds are recorded in the persistent
+        buffers (cursor/best/hit/program) for the scheduler.  Returns the
+        per-structure finalists so the loss can marginalize over them."""
+        if self._enum_order is None:
+            return None
+        device = xs.device
+        m_total = self._enum_order.numel()
+        cursor = int(self.enum_cursor)
+        n = min(n, m_total - cursor)
+        if n <= 0:
+            return None
+        start = time.monotonic()
+        self._enum_eval_acc = 0
+        rows = min(xs.numel(), ENUM_ROWS)
+        xs_s, ns_s, y_s = xs[:rows], ns[:rows], y[:rows]
+        kill = ENUM_KILL if rows >= 32 else ENUM_KILL_SMALL
+        pos = self._enum_order[cursor: cursor + n]
+        st = self._enum_structs.index_select(0, pos)
+        fields = self._enum_fields(st)
+        ra = ENUM_RESTARTS_A
+        f_a = fields.repeat_interleave(ra, dim=0)
+        t_a = torch.randint(
+            0, 4, (n * ra, 8), generator=self._enum_rng
+        ).to(device)
+        tabs, cong = self._enum_steepest(f_a, t_a, xs_s, ns_s, y_s, width)
+        cong = cong.view(n, ra)
+        j = cong.argmax(dim=1)
+        best = cong.gather(1, j.unsqueeze(1)).squeeze(1)
+        best_tab = tabs.view(n, ra, 8)[torch.arange(n, device=device), j]
+        surv = (best >= kill) & (best < 1.0 - 1e-9)
+        rb = max(int(restarts_total) - ra, 0)
+        n_surv = int(surv.sum())
+        if n_surv and rb:
+            s_idx = surv.nonzero(as_tuple=False).flatten()
+            f_b = fields.index_select(0, s_idx).repeat_interleave(rb, dim=0)
+            t_b = torch.randint(
+                0, 4, (n_surv * rb, 8), generator=self._enum_rng
+            ).to(device)
+            tabs_b, cong_b = self._enum_steepest(
+                f_b, t_b, xs_s, ns_s, y_s, width
+            )
+            cong_b = cong_b.view(n_surv, rb)
+            jb = cong_b.argmax(dim=1)
+            best_b = cong_b.gather(1, jb.unsqueeze(1)).squeeze(1)
+            upd = best_b > best[s_idx]
+            u_idx = s_idx[upd]
+            if u_idx.numel():
+                rows_b = upd.nonzero(as_tuple=False).flatten()
+                best[u_idx] = best_b[upd]
+                best_tab[u_idx] = tabs_b.view(n_surv, rb, 8)[rows_b, jb[rows_b]]
+        # verify hits against every available row before recording
+        mask = (1 << width) - 1
+        for k in (best >= 1.0 - 1e-9).nonzero(as_tuple=False).flatten().tolist():
+            out_full = execute_programs(
+                fields[k].unsqueeze(0),
+                torch.zeros(1, dtype=torch.long, device=device),
+                best_tab[k].reshape(1, 1, 8),
+                xs, ns, torch.ones_like(xs), width, 1,
+            )[0]
+            self._enum_eval_acc += 1
+            if bool((((out_full.remainder(ns) ^ y) & mask) == 0).all()):
+                self.enum_prog.copy_(fields[k])
+                self.enum_tab.copy_(best_tab[k])
+                self.enum_hits.add_(1)
+                self.enum_hit_pos.fill_(cursor + k)
+                break
+            best[k] = 0.99  # perfect on the subsample only: demote
+        k_best = int(best.argmax())
+        if float(best[k_best]) > float(self.enum_best_cong):
+            self.enum_best_cong.fill_(float(best[k_best]))
+            self.enum_best_pos.fill_(cursor + k_best)
+        out_fin = self._enum_execute(fields, best_tab, xs_s, ns_s, width)
+        self.enum_cursor.add_(n)
+        self.enum_done.add_(float(n))
+        self.enum_surv.add_(float(n_surv))
+        self.enum_evals.add_(float(self._enum_eval_acc))
+        self.enum_secs.add_(time.monotonic() - start)
+        return {"fields": fields, "tables": best_tab, "out": out_fin,
+                "rows": rows}
+
+    def _enum_log_prior(
+        self, chain: int, fields: Tensor, tables: Tensor
+    ) -> Tensor:
+        """Differentiable log prior of full enumerated programs under one
+        chain's posterior logits (fields shared across alternatives -- the
+        NEVER slots 2..7 -- contribute a common constant and are omitted)."""
+        device = fields.device
+        ls = lambda t: F.log_softmax(t, dim=-1)  # noqa: E731
+        lp = torch.zeros(
+            fields.shape[0], device=device, dtype=self.slot_lm.dtype
+        )
+        for k in (0, 1):
+            col = 7 * k
+            lp = (
+                lp
+                + ls(self.slot_lm[chain, k])[fields[:, col + 0]]
+                + ls(self.slot_dst[chain, k])[fields[:, col + 1]]
+                + ls(self.slot_sb[chain, k])[fields[:, col + 3]]
+                + ls(self.slot_tid[chain, k])[fields[:, col + 4]]
+                + ls(self.slot_ini[chain, k])[fields[:, col + 5]]
+                + ls(self.slot_pred[chain, k])[fields[:, col + 6]]
+            )
+        lp = (
+            lp
+            + ls(self.head_src[chain, 0])[fields[:, 56]]
+            + ls(self.head_dir[chain, 0])[fields[:, 57]]
+            + ls(self.head_src[chain, 1])[fields[:, 58]]
+            + ls(self.head_dir[chain, 1])[fields[:, 59]]
+        )
+        ent = ls(self.table_ent[chain, 0])  # (8, 4)
+        return lp + ent[
+            torch.arange(8, device=device)[None, :], tables
+        ].sum(-1)
+
 
 # ---------------------------------------------------------------------------
 # Loss: exact marginalization over each active block's alternatives
@@ -1022,10 +1581,16 @@ def _target_integer(labels: Tensor, valid: Tensor) -> Tensor:
 
 
 def _bit_match(diff: Tensor, bits: int) -> Tensor:
-    """Mean matched-bit fraction over the low `bits` bits; diff int (..., R)."""
-    shifts = torch.arange(bits, device=diff.device)
-    mism = ((diff.unsqueeze(-1) >> shifts) & 1).sum(dim=(-2, -1))
-    return 1.0 - mism.float() / (bits * diff.shape[-1])
+    """Mean matched-bit fraction over the low `bits` bits; diff int (..., R).
+
+    Branchless SWAR popcount (bit-identical to the former shift-and-sum,
+    verified; valid for diffs up to 56 bits, far above width_max)."""
+    v = diff & ((1 << bits) - 1)
+    v = v - ((v >> 1) & 0x5555555555555555)
+    v = (v & 0x3333333333333333) + ((v >> 2) & 0x3333333333333333)
+    v = (v + (v >> 4)) & 0x0F0F0F0F0F0F0F0F
+    mism = (v * 0x0101010101010101) >> 56
+    return 1.0 - mism.sum(dim=-1).float() / (bits * diff.shape[-1])
 
 
 def _credit(
@@ -1065,12 +1630,52 @@ def token_training_loss(batch: TokenLossBatch) -> Tensor:
         terms.append(
             sharp * 1.15 - torch.logsumexp(log_prior + sharp * credit, dim=0)
         )
-    for chain_lp, out, xs_sub, ns_sub, t1_sel in aux["sweep_terms"]:
+    for chain_lp, out, xs_sub, ns_sub, t1_sel, pack in aux["sweep_terms"]:
         y_sub = y[t1_sel]
         credit = _credit(out, y_sub, ns_sub, width, 1, alpha)
         terms.append(
             sharp * 1.15 - torch.logsumexp(chain_lp + sharp * credit, dim=0)
         )
+        if pack is not None:
+            # record a row-exact in-loop completion for scheduler adoption
+            with torch.no_grad():
+                k = int(credit.argmax())
+                if float(credit[k]) >= 1.0 + CONG_ANCHOR - 0.05:
+                    fields_c, tset_c, bank_c, chain_c = pack
+                    model.s2_prog.copy_(fields_c[k])
+                    model.s2_bank.copy_(bank_c[tset_c[k]])
+                    model.s2_chain.fill_(chain_c)
+                    model.s2_hit.fill_(1)
+
+    # enumeration stage 1: advance the cursor over the scheduled chunk of
+    # canonical structures (batched discrete steepest-descent table search,
+    # recorded in the scheduler buffers) and marginalize over the chunk's
+    # per-structure finalists with the same stage-1 credit
+    enum_n = int(plan.get("enum_n", 0))
+    if enum_n:
+        t1 = (aux["t_values"] == 1).nonzero(as_tuple=False).flatten()
+        if t1.numel() >= ENUM_MIN_ROWS:
+            xs_e = aux["value"][t1]
+            ns_e = ns[t1]
+            y_e = y[t1]
+            with torch.no_grad():
+                res = model._enum_chunk(
+                    xs_e, ns_e, y_e, width, enum_n,
+                    int(plan.get("enum_r", ENUM_RESTARTS_CAP)),
+                )
+            if res is not None:
+                rows = res["rows"]
+                credit = _credit(
+                    res["out"], y_e[:rows], ns_e[:rows], width, 0, alpha
+                )
+                lp = model._enum_log_prior(
+                    int(plan.get("enum_chain", int(model.best_chain))),
+                    res["fields"], res["tables"],
+                )
+                terms.append(
+                    sharp * 1.15
+                    - torch.logsumexp(lp + sharp * credit, dim=0)
+                )
     if terms:
         marginal = torch.stack(terms).mean()
     else:
@@ -1086,9 +1691,19 @@ def token_training_loss(batch: TokenLossBatch) -> Tensor:
         out = aux["map_out"]
         mask = (1 << width) - 1
         w_low = int(ns.max()).bit_length() + 1
-        cong = _bit_match((out.remainder(ns[None, :]) ^ y[None, :]) & mask, w_low)
+        # the congruence anchor is a T=1 property (an unreduced
+        # multiplicative core is congruent ONLY at depth 1 -- deeper rows
+        # truncate on the tape), so score it on the depth-1 rows when any
+        # are present; identical to the old value in stage-1 curriculum
+        # (all selected rows are depth t_min there)
+        cong_diff = (out.remainder(ns[None, :]) ^ y[None, :]) & mask
+        t1_rows = aux["t_values"] == 1
+        if bool(t1_rows.any()):
+            cong = _bit_match(cong_diff[:, t1_rows], w_low)
+        else:
+            cong = _bit_match(cong_diff, w_low)
         in_range = (out < ns[None, :]).float().mean(dim=-1)
-        exact_bits = _bit_match((out ^ y[None, :]) & mask, width)
+        exact_bits = _bit_match((out ^ y[None, :]) & mask, width)  # full-T
         exact_rows = (((out ^ y[None, :]) & mask) == 0).float().mean(dim=-1)
         hit = (cong >= 1.0 - 1e-9).float()
         # freshly resampled chains adopt their first evaluation outright
@@ -1125,6 +1740,20 @@ class Schedule:
         self.stage2_rotation = torch.zeros(NCHAINS, dtype=torch.long)
         self.next_chain = 0
         self.sweep_lo = 0
+        self.loop_lo = 0
+        # enumeration layer: built only when the budget affords it, so short
+        # (probe-scale) budgets keep the exact GA-only trajectory
+        self.enum_enabled = False
+        self.enum_total = 0
+        self.enum_adopted = 0
+        self.stage2_step0 = -1
+        self.ga_seconds = 1.0
+        self.last_step_at = self.started_at
+        self.last_enum_secs = 0.0
+        if float(budget) >= ENUM_MIN_BUDGET:
+            model._enum_space_init()
+            self.enum_total = int(model._enum_order.numel())
+            self.enum_enabled = True
         # crossover units: 8 slots, 2 heads, 4 tables
         self.units = (
             [("slot", i) for i in range(K_SLOTS)]
@@ -1180,6 +1809,70 @@ class Schedule:
             self._set_field(self.model.slot_pred, (chain, slot), PRED_NEVER)
             self.model.slot_pred[chain, slot, PRED_NEVER] += PIN_BIAS - CONF
 
+    def _adopt_enum(self, chain: int) -> None:
+        """Documented parameter transformation: re-center one chain's logits
+        on the enumeration layer's verified congruence-exact program (slots
+        0-1 + heads + table 0), unpin its reserved slots, and mark it stage 2
+        so the completion sweeps assemble the reducer around it."""
+        m = self.model
+        prog = m.enum_prog.detach().cpu().tolist()
+        tab = m.enum_tab.detach().cpu().tolist()
+        for i in range(K_SLOTS):
+            if i in RESERVED_SLOTS:
+                continue
+            self._set_field(m.slot_lm, (chain, i), int(prog[7 * i + 0]))
+            self._set_field(m.slot_dst, (chain, i), int(prog[7 * i + 1]))
+            self._set_field(m.slot_sb, (chain, i), int(prog[7 * i + 3]))
+            self._set_field(m.slot_tid, (chain, i), int(prog[7 * i + 4]))
+            self._set_field(m.slot_ini, (chain, i), int(prog[7 * i + 5]))
+            self._set_field(m.slot_pred, (chain, i), int(prog[7 * i + 6]))
+        for j in range(2):
+            self._set_field(m.head_src, (chain, j), int(prog[56 + 2 * j]))
+            self._set_field(m.head_dir, (chain, j), int(prog[57 + 2 * j]))
+        for e in range(8):
+            self._set_field(m.table_ent, (chain, 0, e), int(tab[e]))
+        for reserved in RESERVED_SLOTS:
+            for tensor in (m.slot_lm, m.slot_dst, m.slot_sb,
+                           m.slot_tid, m.slot_ini, m.slot_pred):
+                tensor[chain, reserved] = torch.randn(
+                    tensor.shape[-1], generator=self.rng
+                ).to(
+                    device=tensor.device, dtype=tensor.dtype
+                ) * 0.05
+            m.slot_pred[chain, reserved, PRED_NEVER] += 1.0
+        m.stage[chain] = 1
+        m.hit_streak[chain] = STREAK_TO_STAGE2
+        m.fit_cong[chain] = 1.0
+        m.fit_range[chain] = 0.0
+        m.fit_exact[chain] = 0.0
+        m.fit_rows[chain] = 0.0
+        m.last_rows[chain] = 0.0
+        m.last_hit[chain] = 1.0
+        m.last_fit[chain] = 1.0
+        m.age[chain] = 1
+
+    def _adopt_s2(self, chain: int) -> None:
+        """Hard adoption of a row-exact stage-2 completion recorded by the
+        loss (documented parameter transformation, mirroring _adopt_enum --
+        the pure gradient flip is fragile when the completion windows rotate
+        every step under global gradient clipping)."""
+        m = self.model
+        prog = m.s2_prog.detach().cpu().tolist()
+        bank = m.s2_bank.detach().cpu()
+        for i in range(K_SLOTS):
+            self._set_field(m.slot_lm, (chain, i), int(prog[7 * i + 0]))
+            self._set_field(m.slot_dst, (chain, i), int(prog[7 * i + 1]))
+            self._set_field(m.slot_sb, (chain, i), int(prog[7 * i + 3]))
+            self._set_field(m.slot_tid, (chain, i), int(prog[7 * i + 4]))
+            self._set_field(m.slot_ini, (chain, i), int(prog[7 * i + 5]))
+            self._set_field(m.slot_pred, (chain, i), int(prog[7 * i + 6]))
+        for j in range(2):
+            self._set_field(m.head_src, (chain, j), int(prog[56 + 2 * j]))
+            self._set_field(m.head_dir, (chain, j), int(prog[57 + 2 * j]))
+        for t in range(N_TID):
+            for e in range(8):
+                self._set_field(m.table_ent, (chain, t, e), int(bank[t, e]))
+
     def _randomize(self, chain: int) -> None:
         m = self.model
         for tensor in (m.slot_lm, m.slot_dst, m.slot_sb, m.slot_tid, m.slot_ini,
@@ -1230,6 +1923,26 @@ class Schedule:
                 m.stage == 1, 2.0 + m.fit_rows, m.last_fit
             ).detach().cpu()
             order = fitness.argsort(descending=True)
+
+            # adopt a verified enumeration hit: re-center the weakest stage-0
+            # chain on the found congruence-exact program and promote it to
+            # stage 2 (the completion sweeps then operate on it)
+            if self.enum_enabled and int(m.enum_hits) > self.enum_adopted:
+                stage_cpu = m.stage.detach().cpu()
+                pool = [
+                    int(c) for c in fitness.argsort()
+                    if int(stage_cpu[c]) == 0 and int(c) != int(m.best_chain)
+                ]
+                if pool:
+                    self._adopt_enum(pool[0])
+                    self.enum_adopted = int(m.enum_hits)
+
+            # adopt a recorded row-exact stage-2 completion outright
+            if int(m.s2_hit) == 1:
+                s2c = int(m.s2_chain)
+                if int(m.stage[s2c]) == 1:
+                    self._adopt_s2(s2c)
+                m.s2_hit.fill_(0)
 
             # cross-chain resampling (documented parameter transformation):
             # generational replacement of everything but the elites, each
@@ -1337,22 +2050,65 @@ class Schedule:
                 r = int(self.stage2_rotation[chain])
                 self.stage2_rotation[chain] += 1
                 if inert:
-                    if r % 3 < 2:
-                        active.append((chain, ("sweep", inert[0])))
-                        self.sweep_lo = (
-                            self.sweep_lo + SWEEP_TABLES_PER_STEP
-                        ) % 65536
+                    if r < STAGE2_LOOP_START:
+                        # affine-validated ordering: once_post sweeps first
+                        if r % 3 < 2:
+                            active.append((chain, ("sweep", inert[0])))
+                            self.sweep_lo = (
+                                self.sweep_lo + SWEEP_TABLES_PER_STEP
+                            ) % 65536
+                        else:
+                            active.append((chain, ("comp", inert[0])))
                     else:
-                        active.append((chain, ("comp", inert[0])))
+                        # no once_post completion adopted: rotate in the
+                        # in-loop reducer sweep (multiplicative cores)
+                        k = r % 4
+                        if k in (0, 2):
+                            active.append((chain, ("loop",)))
+                            self.loop_lo = (
+                                self.loop_lo + LOOP_TABLES_PER_STEP
+                            ) % 65536
+                        elif k == 1:
+                            active.append((chain, ("sweep", inert[0])))
+                            self.sweep_lo = (
+                                self.sweep_lo + SWEEP_TABLES_PER_STEP
+                            ) % 65536
+                        else:
+                            active.append((chain, ("comp", inert[0])))
                 else:
-                    if r % 2 == 0:
+                    in_loop = any(
+                        int(m.slot_lm[chain, rsv].argmax())
+                        in (LM_HEAD_A, LM_HEAD_B)
+                        for rsv in RESERVED_SLOTS
+                    )
+                    if in_loop:
+                        # an in-loop pair is committed: only anchored blocks
+                        # (loop sweep, incumbent-anchored table) may touch it
+                        if r % 2 == 0:
+                            active.append((chain, ("loop",)))
+                            self.loop_lo = (
+                                self.loop_lo + LOOP_TABLES_PER_STEP
+                            ) % 65536
+                        else:
+                            tid = int(
+                                m.slot_tid[chain, RESERVED_SLOTS[0]].argmax()
+                            )
+                            active.append((chain, ("table", tid)))
+                    elif r % 3 == 0:
                         active.append(
                             (chain, ("comp", RESERVED_SLOTS[(r // 2) % 2]))
                         )
-                    else:
+                    elif r % 3 == 1:
                         slot = RESERVED_SLOTS[(r // 2) % 2]
                         tid = int(m.slot_tid[chain, slot].argmax())
                         active.append((chain, ("table", tid)))
+                    else:
+                        # junk once_post commits must not lock out the
+                        # in-loop reducer search
+                        active.append((chain, ("loop",)))
+                        self.loop_lo = (
+                            self.loop_lo + LOOP_TABLES_PER_STEP
+                        ) % 65536
             # stage-1 gradient blocks polish the current elites (memetic)
             elite_pool = [
                 int(c) for c in order[:N_ELITE] if int(m.stage[c]) == 0
@@ -1374,13 +2130,98 @@ class Schedule:
             alpha = ANNEAL_CAP * min(
                 max((frac - ANNEAL_START) / ANNEAL_LEN, 0.0), 1.0
             )
+
+            # enumeration layer plan: chunk size from measured throughput,
+            # restart count from the remaining-budget cost model
+            enum_n = 0
+            enum_r = ENUM_RESTARTS_CAP
+            enum_chain = elite_pool[-1] if elite_pool else int(m.best_chain)
+            if self.enum_enabled:
+                now = time.monotonic()
+                wall = now - self.last_step_at
+                self.last_step_at = now
+                d_enum = float(m.enum_secs) - self.last_enum_secs
+                self.last_enum_secs = float(m.enum_secs)
+                if self.step_count > 2:
+                    self.ga_seconds = (
+                        0.7 * self.ga_seconds + 0.3 * max(wall - d_enum, 1e-3)
+                    )
+                remaining = self.budget - (now - self.started_at)
+                stage2_busy = bool(
+                    ((m.stage == 1) & (m.last_rows < 0.999)).any()
+                )
+                solved = bool(
+                    ((m.stage == 1) & (m.last_rows >= 0.999)).any()
+                )
+                if stage2_busy and self.stage2_step0 < 0:
+                    self.stage2_step0 = self.step_count
+                if not stage2_busy:
+                    self.stage2_step0 = -1
+                stuck = (
+                    stage2_busy
+                    and self.step_count - self.stage2_step0 > ENUM_STUCK_STEPS
+                )
+                m_left = self.enum_total - int(m.enum_cursor)
+                if (
+                    not solved
+                    and (not stage2_busy or stuck)
+                    and remaining > ENUM_TAIL_RESERVE
+                    and m_left > 0
+                    and elite_pool
+                ):
+                    done = float(m.enum_done)
+                    if done > 0:
+                        eps = float(m.enum_evals) / max(float(m.enum_secs), 1e-3)
+                        sfrac = min(max(float(m.enum_surv) / done, 0.05), 1.0)
+                    else:
+                        eps, sfrac = 10000.0, 0.65
+                    enum_budget = max(remaining - ENUM_TAIL_RESERVE, 1.0)
+                    for enum_r in ENUM_RESTART_LADDER:
+                        cost = ENUM_EVA + sfrac * max(
+                            enum_r - ENUM_RESTARTS_A, 0
+                        ) * ENUM_EVR
+                        if m_left * cost <= eps * enum_budget:
+                            break
+                    target = min(12.0, max(1.5, self.budget / 60.0))
+                    enum_sec = max(target - self.ga_seconds, 0.5)
+                    spst = (
+                        ENUM_EVA
+                        + sfrac * max(enum_r - ENUM_RESTARTS_A, 0) * ENUM_EVR
+                    ) / max(eps, 100.0)
+                    chunk_cap = (
+                        ENUM_CHUNK_MAX
+                        if m.slot_lm.device.type == "cpu"
+                        else ENUM_CHUNK_MAX_CUDA
+                    )
+                    enum_n = max(
+                        1,
+                        min(chunk_cap, int(enum_sec / max(spst, 1e-4))),
+                    )
+                    if done == 0:
+                        enum_n = ENUM_CHUNK0
+
             m._plan = {
                 "active": active,
                 "sharp": sharp,
                 "alpha": alpha,
                 "sweep_lo": self.sweep_lo,
+                "loop_lo": self.loop_lo,
                 "full_t": bool(int((m.stage == 1).sum()) > 0),
+                "enum_n": enum_n,
+                "enum_r": enum_r,
+                "enum_chain": enum_chain,
             }
+            if self.enum_enabled and self.step_count % 50 == 0:
+                print(
+                    f"[enum] step={self.step_count}"
+                    f" cursor={int(m.enum_cursor)}/{self.enum_total}"
+                    f" evals={float(m.enum_evals):.3e}"
+                    f" eps={float(m.enum_evals) / max(float(m.enum_secs), 1e-3):.0f}"
+                    f" best={float(m.enum_best_cong):.4f}@{int(m.enum_best_pos)}"
+                    f" hits={int(m.enum_hits)} R={enum_r} n={enum_n}"
+                    f" ga_s={self.ga_seconds:.2f}",
+                    flush=True,
+                )
         multiplier = 1.0
         if frac > 0.92:
             progress = (frac - 0.92) / 0.08

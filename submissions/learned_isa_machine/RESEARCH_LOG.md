@@ -202,3 +202,182 @@ Artifacts: scratchpad sa_logs/round5_squaring_complete.txt, r5_d1_shard*.json, r
 All three recurrence families (affine, squaring, cube-expressible) now have validated
 discovery paths. Next: exhaustive-enumeration stage 1 in submission.py, local-runner proof
 on E1, then hosted Medium.
+
+## Round 6 (2026-08-07): enumeration stage 1 INTEGRATED into submission.py
+
+`submission.py` now carries the round-5 squaring pipeline alongside the GA layer.
+
+Design (all inside the existing population-as-parameters build):
+- `build_enum_space()`: the canonical live two-active-slot structure space,
+  M = 132,616, as an exact vectorized port of the r5-D2 canonicalization
+  (once-segment HEAD collapse, swap-safe order collapse, unread-head pinning,
+  conservative ACC-liveness). Validated against the r5 functions: count match,
+  uniqueness, 4,000/4,000 soundness spot-checks, 762/762 raw->canonical coverage,
+  and both double-and-add target classes present (head_A and head_B variants).
+  Data-free; built at Schedule construction (0.17 s) only when the training
+  budget >= 180 s, so probe-scale (60 s) runs keep the exact V3 GA-only build.
+- VISIT ORDER: `torch.randperm(M, seed=20260807)`. The seed is a date constant
+  committed BEFORE any target position was ever computed; the order is a
+  function of the ISA alone (answer-blind). Never re-drawn.
+- Each training step the scheduler plans a chunk (`enum_n` structures at
+  `enum_r` restarts); `token_training_loss` advances the cursor under no_grad
+  (`model._enum_chunk`): phase A = 12 random-table restarts/structure of the
+  calibrated randomized steepest-descent table learner (24 single-entry
+  neighbors, strict improvement, <= 12 moves, batched across every walker of
+  every structure in the chunk); early-kill structures whose best-of-12
+  congruence < 0.62; survivors get up to `enum_r` total restarts. Verified
+  congruence-exact finds (re-checked on all batch T=1 rows) land in persistent
+  buffers (cursor, best, hit, program) -- the established scheduler-buffer
+  mechanism.
+- The loss stays ONE differentiable scalar: the chunk's per-structure finalists
+  join as one more logsumexp marginal term -- log prior of the full program
+  under a stage-0 elite chain's logits + sharp * the SAME stage-1 credit -- the
+  identical legal shape as the GA block terms (R8/R12 hold; gradients flow to
+  the posterior logits through the enumerated alternatives).
+- On a hit, `Schedule._adopt_enum` re-centers the weakest stage-0 chain's
+  logits on the found program and promotes it straight to stage 2 (documented
+  parameter transformation; same class as the existing crossover re-centering
+  and promotion unpinning).
+- Restart count is budget-adaptive (ladder 110..30): the scheduler picks the
+  largest R whose full-remaining-space cost fits the measured eval rate times
+  the remaining enumeration budget (cost model constants from calibration).
+  Chunk size targets the wall-clock step budget minus the measured GA share.
+
+Stage 2 for multiplicative cores -- the NEW in-loop completion sweep:
+- A once_post conditional subtract CANNOT reduce a multiplicative core (its
+  unreduced T=1 output spans up to ~N*2^bitlen multiples of N); the r5-d3
+  winner interleaves the reducer with the loop: an ACC<-t(ACC,N) TERM- PAIR
+  inside the core's own head segment, trailing the core slots each iteration.
+  The old sweep (once_post only; sufficient for affine's 3x+1 < 3N) provably
+  could not complete squaring -- confirmed in vivo (plant test: stage 2 stuck).
+- New ("loop",) block: enumerates (init x TERM-polarity x single-or-pair)
+  in-loop placements of reserved slots 6-7 reading N, jointly with the entry
+  patterns of a free table (rotating 2,048-window over all 65,536 + 1,024
+  posterior samples + incumbent + explicit no-op anchor row), full-program
+  discrete execution on the step's T=1 rows. Verified: for the adopted true
+  core the candidate set contains exactly the r5 winner (ini 0, TERM-, pair,
+  SUB table [0,3,2,0,3,1,0,3]) and that candidate certifies T in {1,2,3,6} on
+  all 323 x (reference-machine cross-checked).
+- Rotation: the first 24 stage-2 rotations keep the affine-validated
+  once_post-first ordering; afterwards loop blocks join (also on the non-inert
+  rotation so junk once_post commits cannot lock out the reducer search).
+- Two fixes the plant test forced:
+  (a) the congruence anchor (corruption guard / hit streak) is now computed on
+      T=1 rows only -- an unreduced multiplicative core is congruent ONLY at
+      depth 1 (deeper rows truncate on the tape), so the old mixed-T anchor
+      wiped every completion commit, correct ones included. Bit-identical in
+      stage-1 curriculum (all rows are depth t_min there).
+  (b) a row-exact loop completion is recorded in buffers (s2_prog/s2_bank) by
+      the loss and HARD-ADOPTED by the scheduler next step (mirroring
+      _adopt_enum): under global grad clipping (1.0) with windows that rotate
+      every step and stage-2 chains that alternate, the pure logsumexp
+      gradient flip was measured to miss its one-step window.
+
+Throughput engineering (CPU, 3 threads, W=22, 48-row evals):
+- single-table LUT banks (`bank.shape[1]`-aware executor): the 4x-redundant
+  LUT build was superlinear at scale (17 s vs 0.2 s at 12k programs);
+- SWAR popcount `_bit_match` (bit-identical, verified);
+- P_CAP 6,144 programs/call (CPU cache sweet spot; 65,536 on CUDA);
+- measured IN-RUNNER: ~7,300 evals/s sustained; ~1,286 evals/structure at
+  R=30; GA share 0.4-0.6 s of a 12 s step. (Raw uniform-random structures
+  bench at 11.7k ev/s; the canonical mix is head-segment-heavier.)
+
+Calibration (fresh, on the integrated pipeline; scratch sa_logs/enum_*.json):
+- The walk MOVE score must be pure congruence: adding the range bonus to the
+  move score collapses p_hit/restart from 4.4% to 1.0% (the constant-zero
+  attractor is always "in range"). The loss credit itself is unchanged.
+- 48 rows: p_hit/restart = 0.040 (head_A) / 0.035 (head_B); 32 rows halves
+  p_hit (rejected); evals/restart ~59 junk, ~81 true.
+- kill = 0.62 on best-of-12: P(kill true | no hit) ~ 1e-3; junk survivor
+  fraction 0.38-0.44. Detection/structure: R=110 -> 0.985, R=30 -> 0.68.
+
+Audit flags (rules):
+- The enumeration executes inside `token_training_loss` under no_grad (the
+  congruence credit needs labels, which forward does not see); the returned
+  loss remains one differentiable scalar and the evaluator's backward reaches
+  the posterior logits through the enum finalists' log-prior (same legality
+  class as the existing discrete block enumerations scored in the loss).
+- Adoption (enum hit, stage-2 completion) = scheduler parameter
+  transformations, documented above; precedent: crossover re-centering,
+  promotion unpinning, corruption-guard re-inerting.
+- No data inspection beyond the batch tensors the loss already receives; the
+  structure space and visit order are data-free; budget gating (enum off
+  below 180 s) is wall-clock-based, not data-based.
+- Buffers added (enum_*, s2_*) are training-updated only; eval path untouched;
+  state well under the cap; source ~92 KiB < 256 KiB.
+- port_check: ALL PASS on the final build (executor semantics unchanged;
+  popcount bit-exact).
+
+Validation of the integrated build (2026-08-07, all through the UNMODIFIED
+benchmark runner):
+- Machinery plant test (scratch copy `sub_plant.py` ONLY -- moves the known
+  head_A core to visit position 30 and forces R=110; the shipped submission
+  is never planted): 1800 s E1 manifest -> enum hit at position 30, verified,
+  adopted, in-loop stage 2 completes, **score 1.0, depth ladder AND OOD-N
+  ladder certified to T=64** (635 steps). The identical run before the
+  in-loop sweep existed proved the once_post-only stage 2 CANNOT complete
+  squaring (stuck, enum resumed) -- the fix is load-bearing.
+- E1 600 s smoke (real submission): mechanics clean, 2,175 structures
+  covered, 7.26k evals/s sustained, enum pauses at the tail reserve, GA
+  share 0.44 s/step, eval pipeline intact (score 4% -- no hit expected).
+- Affine 60 s regression (real submission, run twice): **score 1.0 both
+  runs** (54 and 71 steps). The GA layer still wins the probe manifest.
+
+## E1 LOCAL LONG PROOF (launched 2026-08-07 ~08:30 UTC)
+
+Manifest `SCRATCH/e1_local_longproof.json` = local_cpu_e1_3600s with
+total_training_time_seconds = 21,600 (6 h cap). Coverage math at measured
+in-runner throughput (7.3k evals/s, 1,286 evals/structure at ladder-chosen
+R=30, ~4% GA share): 60% coverage needs ~4.1 h; 6 h projects ~87%.
+Detection per covered target at R=30: 0.68 (ladder may raise R late as the
+remaining-space/budget ratio improves).
+
+Answer-blind order audit: ENUM_ORDER_SEED = 20260807 was committed before
+any target position was computed (it is a pure date constant over the
+data-free canonical space). Positions computed only AFTER the proof was
+launched, for reporting: head_B variant at visit position 78,605 (59.3% of
+space, expected reach ~3.9-4.3 h), head_A at 122,166 (92.1%, marginal within
+budget). An unlucky draw (expected min position = M/3 = 33%); it is what the
+committed seed says it is. Expected P(certify this run) ~ 0.68-0.75.
+
+RUN 1 (08:29-09:30 UTC, killed by infrastructure, NOT by the benchmark): the
+blind enumeration found a congruence-exact core at visit position 17,275
+(13% of the space, elapsed ~55 min) -- an ALIAS of the head_A double-and-add
+core this analysis had not counted: the doubling slot commits on TERM-
+instead of ALWAYS (the carry-out of ACC+ACC is always 0 in range, so the
+predicates are semantically identical there). Verified on all batch T=1
+rows, adopted, and the in-loop stage 2 completed: by step 500 (elapsed
+3,558 s) the stage-2 sweeps had stopped (solved) and the training loss had
+collapsed to 0.023. Semantic-alias classes mean the effective number of
+perfect structures in the canonical space is well above the 2 literal
+targets, so the a-priori P(success) estimates were pessimistic. The harness
+killed the background process at exactly 1 h wall (its task cap), before
+the budget completed -- no RESULT_JSON; log preserved as
+SCRATCH/e1_proof_run1_killed.log. Relaunched detached at 09:31 UTC with the
+same manifest, same submission, same committed seed (each run is a fresh
+detection draw -- chunk boundaries follow the wall clock, so the enum RNG
+stream is not replayed).
+
+## H100 projections (Medium 600 s / Hard 3600 s)
+
+Per-eval cost model: one structure-eval = 2 slots x W head iterations x
+ceil(W/4) LUT gathers + ~8 index/commit passes each, on (P, rows) int64
+tensors ~= 1 MB traffic per 48-row eval at W=22. Measured CPU floor: 2.4k
+evals/s/thread (7.3k at 3 threads). H100 (P_CAP_CUDA = 65,536 programs/call,
+~1,400 kernel launches/call ~= 10 ms + ~35 ms memory time at ~2 TB/s):
+~1.5M evals/s ceiling at W=22; conservative planning band 300-800k evals/s.
+Medium moduli are 12-16 bits -> W = 28-36 -> per-eval cost x(W/22)^2 ~= 2.7
+at W=36 -> 120-320k evals/s.
+
+- HARD (3600 s, W~22-26 tasks): exhaustive R=110 sweep = 132,616 x ~3,500 =
+  4.6e8 evals = 575-1,500 s -> FULL coverage with detection 0.985/target,
+  P(find >= 1 of 2 cores) ~ 0.9997, using < half the budget; stage 2 adds
+  seconds. Chunk controller: ~1,000-4,000 structures/step at 12 s steps
+  (ENUM_CHUNK_MAX_CUDA = 4096); the ladder holds R=110 throughout.
+- MEDIUM (600 s): enum budget ~350-450 s -> 4e7-1.4e8 evals at W=28-36 ->
+  coverage 23-80% at ladder R=30-40, P(find) ~ 0.3-0.7 per attempt for a
+  squaring-class task. NOT reliably exhaustive; multiple attempts/day (6)
+  compound to ~0.9+. Open risk flagged: the p_hit/restart basin (4%) is
+  calibrated at N=323 (9-bit); 12-16-bit moduli are unmeasured (the walk is
+  per-entry local so the basin should transfer, but W-dependence is untested).
+- Affine/cube-class Medium tasks ride the unchanged GA + tier-1 path.
