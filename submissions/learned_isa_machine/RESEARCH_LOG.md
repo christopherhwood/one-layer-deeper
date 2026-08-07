@@ -340,6 +340,18 @@ space, expected reach ~3.9-4.3 h), head_A at 122,166 (92.1%, marginal within
 budget). An unlucky draw (expected min position = M/3 = 33%); it is what the
 committed seed says it is. Expected P(certify this run) ~ 0.68-0.75.
 
+RUN 2 (relaunched 09:31 UTC detached; the honest proof): the blind
+enumeration hit a VERIFIED congruence-exact core at visit position 37,694
+(28.4% of the space) at elapsed ~7,750 s (~2 h 09 m) -- a THIRD distinct
+double-and-add alias: head_A pair with init=1 scan states (doubling slot
+TERM+, add slot HEAD+, table entries adapted to the flipped carry
+convention). Missed the first alias at 17,275 on its detection draw
+(per-pass detection 0.68 at R=30, as calibrated). Stage 2 (in-loop reducer
+sweep + hard adoption) completed within ~285 s of the hit: by step 1000
+(elapsed 8,035 s) the training loss had collapsed to 0.0230 and the stage-2
+sweeps stopped (solved). Enumeration self-paused after the hit. Awaiting
+end-of-budget evaluation for score + rung certification.
+
 RUN 1 (08:29-09:30 UTC, killed by infrastructure, NOT by the benchmark): the
 blind enumeration found a congruence-exact core at visit position 17,275
 (13% of the space, elapsed ~55 min) -- an ALIAS of the head_A double-and-add
@@ -381,3 +393,15 @@ at W=36 -> 120-320k evals/s.
   calibrated at N=323 (9-bit); 12-16-bit moduli are unmeasured (the walk is
   per-entry local so the basin should transfer, but W-dependence is untested).
 - Affine/cube-class Medium tasks ride the unchanged GA + tier-1 path.
+
+## PROOF (2026-08-07): E1 discovered and FULLY CERTIFIED through the unmodified runner
+
+Local 6h CPU run, real E1 dataset, benchmark.runner untouched: enumeration hit the
+squaring core at cursor 37,694/132,616 (answer-blind order); stage 2 completed in-run.
+RESULT_JSON: mean_exact_accuracy 1.0 (test 150/150, OOD-T6 100/100); seen-N ladder
+T=1..64 ALL certified; OOD-N ladder T=1..64 ALL certified (512/512 per rung) — the
+discovered program is N-generic, so OOD-N certification came free. Eval used 5.3s.
+Hosted Easy probe of the same build: succeeded, 8.00% (137 steps/60s — coverage-bound,
+as projected; Easy cannot reach the hit depth in-order). Next: Medium derisk (no T=1
+rows on M-sets -> t_min=2 congruence needs W >= ~4*bitlen(N); basin transfer at
+12-16-bit unmeasured), then Medium attempts.

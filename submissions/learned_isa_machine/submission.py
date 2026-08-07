@@ -379,12 +379,26 @@ def execute_programs(
     return_state: bool = False,
     lut_cache: LutCache | None = None,
     max_k: int = 4,
+    mod_between_steps: bool = False,
 ) -> Tensor | tuple[Tensor, Tensor]:
     """Run P programs on R rows, latching each row at its own T.
 
     fields: (P, 60) long -- 8 slots x [lm,dst,sa,sb,tid,ini,pr] + 4 head
     fields; tset: (P,) index into bank (Q, 4, 8) of table sets.  Registers
     are integers; every committed value is a hard integer register.
+
+    mod_between_steps (loss-side scoring ONLY; never the eval path): between
+    outer steps, V is re-injected as ACC mod N instead of raw ACC.  This is
+    the t_min>1 generalization of the congruence credit: the label recurrence
+    itself is "apply the hidden map, then reduce mod N" iterated T times
+    (mod-N-per-step is task-family structure carried by the prompt's N; the
+    hidden map is never referenced), so scoring a candidate's t_min-fold
+    self-composition with the label's own mod-N step interleaved is the same
+    label re-expression class as the established congruence credit -- and it
+    keeps every intermediate magnitude within one unreduced application
+    (width 2*bitlen(N)+4), so no tape widening is needed at any t_min.
+    The latched value at each row's own T stays UNREDUCED (pre-re-injection),
+    exactly matching the T=1 credit convention.
     """
     device = fields.device
     p_total = fields.shape[0]
@@ -506,7 +520,10 @@ def execute_programs(
         latched = torch.where(ts.unsqueeze(0) == t_step, regs[4], latched)
         if return_state and t_step == t_max:
             return latched, regs
-        regs[0] = regs[4]
+        if mod_between_steps:
+            regs[0] = regs[4].remainder(regs[1])
+        else:
+            regs[0] = regs[4]
     return latched
 
 
@@ -926,6 +943,7 @@ class Model(nn.Module):
         plan = self._plan
         with torch.no_grad():
             map_fields, map_tables = self.map_fields()
+            t_min = int(t_values.min())
             # stage-1 curriculum: execute only the shallowest rows at their
             # own depth (predecessor's t_min precedent); once any chain is in
             # stage 2, execute every row at its own T (per-row latching).
@@ -933,8 +951,14 @@ class Model(nn.Module):
                 sel = torch.arange(
                     min(input_ids.shape[0], FULL_T_ROWS), device=input_ids.device
                 )
+                if t_min > 1:
+                    # datasets without depth-1 rows: guarantee a t_min-row
+                    # supply for the completion sweeps and the enum layer
+                    extra = (t_values == t_min).nonzero(
+                        as_tuple=False
+                    ).flatten()[:ENUM_ROWS]
+                    sel = torch.unique(torch.cat([sel, extra]))
             else:
-                t_min = int(t_values.min())
                 sel = (t_values == t_min).nonzero(as_tuple=False).flatten()
                 if sel.numel() == 0:
                     sel = torch.arange(input_ids.shape[0], device=input_ids.device)
@@ -975,17 +999,25 @@ class Model(nn.Module):
         if self._lut_cache is None:
             self._lut_cache = LutCache(NCHAINS * 4, 2048)
         with torch.no_grad():
+            # in the stage-1 curriculum on datasets whose shallowest depth is
+            # t_min > 1, all programs are scored via their mod-N-interleaved
+            # self-composition (see execute_programs docstring); once stage 2
+            # opens, MAP chains run REAL per-row-T execution so exactness of
+            # a completed program is measured on the true task.
+            composed = (not plan.get("full_t")) and t_min > 1
             all_out = execute_programs(
                 all_fields, all_tset, all_banks, value_e, modulus_e,
                 t_e, width, t_max, lut_cache=self._lut_cache,
+                mod_between_steps=composed,
             )
         map_out = all_out[:NCHAINS]
         alt_outs = [all_out[lo:hi] for lo, hi in spans]
 
         # stage-2 completion sweeps: shared core state, enumerated
-        # (completion-combo x table-pattern) alternatives on depth-1 rows.
+        # (completion-combo x table-pattern) alternatives on the shallowest
+        # (depth t_min) rows, scored by t_min-fold self-composition.
         sweep_terms = []
-        t1_sel = (t_e == 1).nonzero(as_tuple=False).flatten()[:SWEEP_ROWS]
+        t1_sel = (t_e == t_min).nonzero(as_tuple=False).flatten()[:SWEEP_ROWS]
         for chain, block in sweeps:
             if t1_sel.numel() == 0:
                 fields, tset, extra, log_prior = self._block_alternatives(
@@ -1004,6 +1036,7 @@ class Model(nn.Module):
                 lp_l, out_l, xs_l, ns_l, pack = self._loop_sweep(
                     chain, map_fields, map_tables,
                     value_e[t1_sel], modulus_e[t1_sel], width, plan,
+                    t_comp=t_min,
                 )
                 sweep_terms.append((lp_l, out_l, xs_l, ns_l, t1_sel, pack))
                 continue
@@ -1011,6 +1044,7 @@ class Model(nn.Module):
                 self._completion_sweep(
                     chain, block, map_fields, map_tables,
                     value_e[t1_sel], modulus_e[t1_sel], width, plan,
+                    t_comp=t_min,
                 )
                 + (t1_sel, None)
             )
@@ -1052,6 +1086,7 @@ class Model(nn.Module):
         ns: Tensor,
         width: int,
         plan: dict,
+        t_comp: int = 1,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Stage-2 completion blocks over one reserved once_post slot.
 
@@ -1062,6 +1097,14 @@ class Model(nn.Module):
         table_id, init, predicate) with the chain's current tables.
         Execution is discrete; because the reserved slots trail every other
         slot, all alternatives share the core's register state exactly.
+
+        t_comp > 1 (datasets without depth-1 rows): candidates are scored by
+        REAL execution at depth t_comp -- a correct completion reduces ACC
+        every step, so its magnitudes fit the tape at any depth, and junk
+        candidates that wrap simply score low.  The shared-core shortcut is
+        only valid at depth 1 (a once_post commit changes V for the following
+        step), so t_comp > 1 forces full-program execution with the smaller
+        fallback window.
         """
         device = xs.device
         kind, slot = block[0], block[1]
@@ -1077,6 +1120,7 @@ class Model(nn.Module):
                     used.add(int(core[7 * i + 4]))
             free_tables = [t for t in range(N_TID) if t not in used]
             shared_core = bool(free_tables) or kind == "comp"
+            analytic = shared_core and t_comp == 1
             t_free = free_tables[0] if free_tables else N_TID - 1
             if kind == "comp":
                 combos = COMP_COMBOS.to(device)
@@ -1085,14 +1129,14 @@ class Model(nn.Module):
                 combos = SWEEP_COMBOS.to(device)
                 lo = plan["sweep_lo"]
                 n_win = (
-                    SWEEP_TABLES_PER_STEP if shared_core
+                    SWEEP_TABLES_PER_STEP if analytic
                     else SWEEP_TABLES_FALLBACK
                 )
                 ids = (lo + torch.arange(n_win, device=device)) % 65536
                 window = (
                     ids[:, None] >> (2 * torch.arange(8, device=device))[None]
                 ) & 3
-                if shared_core:
+                if analytic:
                     # sample on CPU: self._exec_rng is a CPU generator and
                     # torch.multinomial rejects a generator/probs device split
                     probs = F.softmax(
@@ -1110,7 +1154,7 @@ class Model(nn.Module):
                     tables = window
             n_combo = combos.shape[0]
             n_pat = tables.shape[0]
-            if shared_core:
+            if analytic:
                 _, regs = execute_programs(
                     core.unsqueeze(0),
                     torch.zeros(1, dtype=torch.long, device=device),
@@ -1162,7 +1206,7 @@ class Model(nn.Module):
                 tset = torch.arange(n_pat, device=device).repeat(n_combo)
                 result = execute_programs(
                     fields, tset, bank, xs, ns,
-                    torch.ones_like(xs), width, 1,
+                    torch.full_like(xs, t_comp), width, t_comp,
                 )
         self._sweep_debug = (kind, slot, combos, tables, t_free, shared_core)
         ls = lambda t: F.log_softmax(t, dim=-1)  # noqa: E731
@@ -1195,6 +1239,7 @@ class Model(nn.Module):
         ns: Tensor,
         width: int,
         plan: dict,
+        t_comp: int = 1,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Stage-2 IN-LOOP completion block.
 
@@ -1225,6 +1270,7 @@ class Model(nn.Module):
                 return self._completion_sweep(
                     chain, ("sweep", RESERVED_SLOTS[0]),
                     map_fields, map_tables, xs, ns, width, plan,
+                    t_comp=t_comp,
                 ) + (None,)
             seg = segs[0]
             used = {
@@ -1283,7 +1329,8 @@ class Model(nn.Module):
             bank[:, t_free] = tables
             tset = torch.arange(n_pat, device=device).repeat(n_combo)
             result = execute_programs(
-                fields, tset, bank, xs, ns, torch.ones_like(xs), width, 1,
+                fields, tset, bank, xs, ns,
+                torch.full_like(xs, t_comp), width, t_comp,
             )
         self._loop_debug = (seg, combos, tables, t_free, bool(free_tables))
         ls = lambda t: F.log_softmax(t, dim=-1)  # noqa: E731
@@ -1333,15 +1380,23 @@ class Model(nn.Module):
     # -- enumeration stage 1 --------------------------------------------------
 
     def _enum_space_init(self) -> float:
-        """Build the canonical structure list + the fixed-seed visit order."""
+        """Build the canonical structure list + the per-run visit order."""
         if self._enum_structs is not None:
             return 0.0
         start = time.monotonic()
         device = self.slot_lm.device
         structs = build_enum_space().to(device)
+        # Per-attempt order variation: the hosted evaluator pins its run seed,
+        # so with a constant permutation seed every repeated attempt would
+        # walk the SAME prefix of the visit order and daily attempts would not
+        # compound.  Mix wall-clock time at construction into the seed: this
+        # entropy source is answer-blind (a function of when the run starts,
+        # never of the data, labels, or any structure's score) and the order
+        # remains a permutation of the same data-free canonical space.
+        seed = ENUM_ORDER_SEED ^ (time.time_ns() % (1 << 31))
         order = torch.randperm(
             structs.shape[0],
-            generator=torch.Generator().manual_seed(ENUM_ORDER_SEED),
+            generator=torch.Generator().manual_seed(seed),
         ).to(device)
         self._enum_structs = structs
         self._enum_order = order
@@ -1365,9 +1420,11 @@ class Model(nn.Module):
         return fields
 
     def _enum_execute(
-        self, fields: Tensor, tables: Tensor, xs: Tensor, ns: Tensor, width: int
+        self, fields: Tensor, tables: Tensor, xs: Tensor, ns: Tensor,
+        width: int, t_comp: int = 1,
     ) -> Tensor:
-        """Discrete execution of (program, its-own-table) rows at T=1."""
+        """Discrete execution of (program, its-own-table) rows at depth
+        t_comp (mod-N-interleaved self-composition when t_comp > 1)."""
         p_total = fields.shape[0]
         cap = ENUM_P_CAP if fields.device.type == "cpu" else ENUM_P_CAP_CUDA
         outs = []
@@ -1379,7 +1436,8 @@ class Model(nn.Module):
                     f,
                     torch.arange(f.shape[0], device=f.device),
                     t.unsqueeze(1),
-                    xs, ns, torch.ones_like(xs), width, 1,
+                    xs, ns, torch.full_like(xs, t_comp), width, t_comp,
+                    mod_between_steps=t_comp > 1,
                 )
             )
         self._enum_eval_acc += p_total
@@ -1403,7 +1461,7 @@ class Model(nn.Module):
 
     def _enum_steepest(
         self, fields: Tensor, tables: Tensor,
-        xs: Tensor, ns: Tensor, y: Tensor, width: int,
+        xs: Tensor, ns: Tensor, y: Tensor, width: int, t_comp: int = 1,
     ) -> tuple[Tensor, Tensor]:
         """Randomized steepest descent over single table entries: each walker
         moves to the best of its 24 one-entry neighbors while that strictly
@@ -1412,7 +1470,7 @@ class Model(nn.Module):
         device = fields.device
         tables = tables.clone()
         n_walk = tables.shape[0]
-        out = self._enum_execute(fields, tables, xs, ns, width)
+        out = self._enum_execute(fields, tables, xs, ns, width, t_comp)
         cong, score = self._enum_score(out, y, ns, width)
         alive = torch.ones(n_walk, dtype=torch.bool, device=device)
         pat_e = torch.arange(8, device=device).repeat_interleave(3)  # (24,)
@@ -1429,7 +1487,7 @@ class Model(nn.Module):
             new_v = alt.repeat(na)
             new_v = new_v + (new_v >= cur).long()
             cand_t.scatter_(1, e_col, new_v.unsqueeze(1))
-            o = self._enum_execute(cand_f, cand_t, xs, ns, width)
+            o = self._enum_execute(cand_f, cand_t, xs, ns, width, t_comp)
             c_nb, s_nb = self._enum_score(o, y, ns, width)
             s_nb = s_nb.view(na, 24)
             j = s_nb.argmax(dim=1)
@@ -1446,7 +1504,7 @@ class Model(nn.Module):
 
     def _enum_chunk(
         self, xs: Tensor, ns: Tensor, y: Tensor, width: int,
-        n: int, restarts_total: int,
+        n: int, restarts_total: int, t_comp: int = 1,
     ) -> dict | None:
         """Advance the enumeration cursor over the next n structures.
 
@@ -1477,7 +1535,9 @@ class Model(nn.Module):
         t_a = torch.randint(
             0, 4, (n * ra, 8), generator=self._enum_rng
         ).to(device)
-        tabs, cong = self._enum_steepest(f_a, t_a, xs_s, ns_s, y_s, width)
+        tabs, cong = self._enum_steepest(
+        f_a, t_a, xs_s, ns_s, y_s, width, t_comp
+        )
         cong = cong.view(n, ra)
         j = cong.argmax(dim=1)
         best = cong.gather(1, j.unsqueeze(1)).squeeze(1)
@@ -1492,7 +1552,7 @@ class Model(nn.Module):
                 0, 4, (n_surv * rb, 8), generator=self._enum_rng
             ).to(device)
             tabs_b, cong_b = self._enum_steepest(
-                f_b, t_b, xs_s, ns_s, y_s, width
+                f_b, t_b, xs_s, ns_s, y_s, width, t_comp
             )
             cong_b = cong_b.view(n_surv, rb)
             jb = cong_b.argmax(dim=1)
@@ -1510,7 +1570,8 @@ class Model(nn.Module):
                 fields[k].unsqueeze(0),
                 torch.zeros(1, dtype=torch.long, device=device),
                 best_tab[k].reshape(1, 1, 8),
-                xs, ns, torch.ones_like(xs), width, 1,
+                xs, ns, torch.full_like(xs, t_comp), width, t_comp,
+                mod_between_steps=t_comp > 1,
             )[0]
             self._enum_eval_acc += 1
             if bool((((out_full.remainder(ns) ^ y) & mask) == 0).all()):
@@ -1524,7 +1585,7 @@ class Model(nn.Module):
         if float(best[k_best]) > float(self.enum_best_cong):
             self.enum_best_cong.fill_(float(best[k_best]))
             self.enum_best_pos.fill_(cursor + k_best)
-        out_fin = self._enum_execute(fields, best_tab, xs_s, ns_s, width)
+        out_fin = self._enum_execute(fields, best_tab, xs_s, ns_s, width, t_comp)
         self.enum_cursor.add_(n)
         self.enum_done.add_(float(n))
         self.enum_surv.add_(float(n_surv))
@@ -1630,6 +1691,8 @@ def token_training_loss(batch: TokenLossBatch) -> Tensor:
         terms.append(
             sharp * 1.15 - torch.logsumexp(log_prior + sharp * credit, dim=0)
         )
+    t_all = aux["t_values"]
+    t_min = int(t_all.min()) if t_all.numel() else 1
     for chain_lp, out, xs_sub, ns_sub, t1_sel, pack in aux["sweep_terms"]:
         y_sub = y[t1_sel]
         credit = _credit(out, y_sub, ns_sub, width, 1, alpha)
@@ -1637,23 +1700,35 @@ def token_training_loss(batch: TokenLossBatch) -> Tensor:
             sharp * 1.15 - torch.logsumexp(chain_lp + sharp * credit, dim=0)
         )
         if pack is not None:
-            # record a row-exact in-loop completion for scheduler adoption
+            # record a row-exact in-loop completion for scheduler adoption --
+            # after verifying it with REAL per-row-T execution on every
+            # selected row (guards against composition-only artifacts)
             with torch.no_grad():
                 k = int(credit.argmax())
                 if float(credit[k]) >= 1.0 + CONG_ANCHOR - 0.05:
                     fields_c, tset_c, bank_c, chain_c = pack
-                    model.s2_prog.copy_(fields_c[k])
-                    model.s2_bank.copy_(bank_c[tset_c[k]])
-                    model.s2_chain.fill_(chain_c)
-                    model.s2_hit.fill_(1)
+                    ver = execute_programs(
+                        fields_c[k].unsqueeze(0),
+                        torch.zeros(1, dtype=torch.long, device=y.device),
+                        bank_c[tset_c[k]].unsqueeze(0),
+                        aux["value"], ns, t_all, width, int(t_all.max()),
+                    )[0]
+                    mask_w = (1 << width) - 1
+                    if bool((((ver ^ y) & mask_w) == 0).all()):
+                        model.s2_prog.copy_(fields_c[k])
+                        model.s2_bank.copy_(bank_c[tset_c[k]])
+                        model.s2_chain.fill_(chain_c)
+                        model.s2_hit.fill_(1)
 
     # enumeration stage 1: advance the cursor over the scheduled chunk of
     # canonical structures (batched discrete steepest-descent table search,
     # recorded in the scheduler buffers) and marginalize over the chunk's
-    # per-structure finalists with the same stage-1 credit
+    # per-structure finalists with the same stage-1 credit.  On datasets
+    # whose shallowest depth is t_min > 1 the walk scores the t_min-fold
+    # mod-N-interleaved self-composition (see execute_programs docstring).
     enum_n = int(plan.get("enum_n", 0))
     if enum_n:
-        t1 = (aux["t_values"] == 1).nonzero(as_tuple=False).flatten()
+        t1 = (aux["t_values"] == t_min).nonzero(as_tuple=False).flatten()
         if t1.numel() >= ENUM_MIN_ROWS:
             xs_e = aux["value"][t1]
             ns_e = ns[t1]
@@ -1662,6 +1737,7 @@ def token_training_loss(batch: TokenLossBatch) -> Tensor:
                 res = model._enum_chunk(
                     xs_e, ns_e, y_e, width, enum_n,
                     int(plan.get("enum_r", ENUM_RESTARTS_CAP)),
+                    t_comp=t_min,
                 )
             if res is not None:
                 rows = res["rows"]
@@ -1691,13 +1767,13 @@ def token_training_loss(batch: TokenLossBatch) -> Tensor:
         out = aux["map_out"]
         mask = (1 << width) - 1
         w_low = int(ns.max()).bit_length() + 1
-        # the congruence anchor is a T=1 property (an unreduced
-        # multiplicative core is congruent ONLY at depth 1 -- deeper rows
-        # truncate on the tape), so score it on the depth-1 rows when any
-        # are present; identical to the old value in stage-1 curriculum
-        # (all selected rows are depth t_min there)
+        # the congruence anchor is a shallowest-depth property (an unreduced
+        # multiplicative core is congruent ONLY at the composed depth --
+        # deeper rows truncate on the tape), so score it on the t_min rows
+        # when any are present; identical to the old value in stage-1
+        # curriculum (all selected rows are depth t_min there)
         cong_diff = (out.remainder(ns[None, :]) ^ y[None, :]) & mask
-        t1_rows = aux["t_values"] == 1
+        t1_rows = aux["t_values"] == t_min
         if bool(t1_rows.any()):
             cong = _bit_match(cong_diff[:, t1_rows], w_low)
         else:
