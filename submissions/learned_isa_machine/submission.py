@@ -132,7 +132,10 @@ SWEEP_COMBOS = torch.cat(
 # ---------------------------------------------------------------------------
 ENUM_ORDER_SEED = 20260807  # date constant, committed before any position math
 ENUM_MIN_BUDGET = 180.0     # below this budget the GA layer runs alone
-ENUM_TAIL_RESERVE = 180.0   # keep this much budget for stage 2 + polish
+ENUM_TAIL_RESERVE = 240.0   # keep this much budget for stage 2 + polish
+#                             (raised 180->240 for Medium: stage-2 loop
+#                             windows cost ~5.9x their Easy-scale price at
+#                             W=36/t2 — measured in the M5-like plant run)
 ENUM_ROWS = 48              # rows per table-search evaluation (measured: 32
 #                             rows halve p_hit; 48 keep the round-5 basin)
 ENUM_MIN_ROWS = 16
@@ -1453,7 +1456,11 @@ class Model(nn.Module):
         to the MOVE score collapses p_hit from 4.4% to 1.0% per restart,
         because the constant-zero attractor is always "in range".  The full
         stage-1 credit, range bonus included, still scores the finalists in
-        the loss marginal.)"""
+        the loss marginal.  Re-measured at Medium widths, 2026-08-07: a
+        low-bit-weighted move score, sideways moves, pair moves, CRT
+        factor-decomposed scoring and screened inits were all tried against
+        the wide-moduli basin collapse and none beat plain congruence --
+        see RESEARCH_LOG round 7.)"""
         mask = (1 << width) - 1
         w_low = int(ns.max()).bit_length() + 1
         cong = _bit_match((out.remainder(ns[None, :]) ^ y[None, :]) & mask, w_low)
@@ -1530,7 +1537,7 @@ class Model(nn.Module):
         pos = self._enum_order[cursor: cursor + n]
         st = self._enum_structs.index_select(0, pos)
         fields = self._enum_fields(st)
-        ra = ENUM_RESTARTS_A
+        ra = min(ENUM_RESTARTS_A, max(int(restarts_total), 1))
         f_a = fields.repeat_interleave(ra, dim=0)
         t_a = torch.randint(
             0, 4, (n * ra, 8), generator=self._enum_rng

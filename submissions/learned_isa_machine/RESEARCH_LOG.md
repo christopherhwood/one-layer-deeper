@@ -405,3 +405,163 @@ Hosted Easy probe of the same build: succeeded, 8.00% (137 steps/60s — coverag
 as projected; Easy cannot reach the hit depth in-order). Next: Medium derisk (no T=1
 rows on M-sets -> t_min=2 congruence needs W >= ~4*bitlen(N); basin transfer at
 12-16-bit unmeasured), then Medium attempts.
+
+## Round 7 (2026-08-07): Medium derisk — R1 killed, R2 measured (basin collapse is real)
+
+### R1 — no-T=1-rows: found DEAD paths, fixed via mod-interleaved self-composition
+
+Dataset facts (scripts/generate_datasets.sh): t_min per M-set is M1/M2=4, M3=2 (fixed
+T=2, 11/13/15-bit), M4=8 (14/18/22-bit), M5=2 (12/14/16-bit, T{2,4,8}). NOT
+"M2/M4 t_min=2" as previously assumed.
+
+What the pre-fix code did on any M-set (audited + confirmed by reading the gates):
+- `token_training_loss` gated the ENTIRE enum layer on `t_values == 1` rows
+  (>= 16 of them). Medium batches have none -> stage-1 enumeration NEVER RAN.
+- Stage-2 sweeps selected `t_e == 1` rows -> always empty -> fell back to slot
+  blocks -> stage 2 could NEVER complete. The congruence anchor also keyed on T=1.
+- Even with rows re-keyed to t_min: an unreduced core composed t_min times
+  computes x^(2^t_min) -> 4*bitlen(N) bits at t=2 (up to 64 at 16-bit; > int64),
+  16*bitlen at t=4 (impossible) -> congruence credit silently wrapped/wrong.
+
+FIX (shipped): `execute_programs(..., mod_between_steps=True)` — loss-side-only
+execution mode that re-injects V = ACC mod N between outer steps.  This is the
+t_min>1 generalization of the congruence credit: the label recurrence is
+"hidden map, then mod N" iterated, so scoring the machine's t_min-fold
+self-composition with the label's own mod-N step interleaved is the same label
+re-expression class as congruence credit (mod-N is family structure carried in
+the prompt; the hidden map is never referenced).  Magnitudes stay within one
+unreduced application -> W = 2*bitlen+4 unchanged at ANY t_min (no widening,
+no int64 risk; M1/M2/M4 become expressible too, basin aside).  Wired through:
+stage-1 curriculum executes composed when t_min>1; enum walk + hit verification
+composed at t_min; sweep/enum row supply re-keyed to t_min rows (with a t_min
+row top-up in the full_t selection); anchor re-keyed to t_min rows.  At
+t_min==1 every path is bit-identical to the E1-certified build (port_check ALL
+PASS; unit checks: composition == manual per-step, true core composed-
+congruence-exact at 14/16-bit, complete r5-style program real==composed==labels
+at T{2,4,8} — scratch r6_comp_check.py).
+- Stage-2 candidates are scored by REAL depth-t_min execution (not composition):
+  a correct completion reduces every step so it fits the tape; junk wraps and
+  scores low.  s2 recording now also HARD-VERIFIES the candidate with real
+  per-row-T execution on all selected rows before the scheduler adopts it.
+- Variable-N (M3/M5): confirmed per-row N everywhere (parse, executor regs,
+  enum fitness remainder, sweeps, verification); w_low keys on ns.max().
+
+### R2 — basin transfer at Medium widths: COLLAPSES ~20x; cause decomposed
+
+Measured with the shipped walk (`_enum_steepest`), 48 rows, t2 mod-composed
+credit, 1200-4800 restarts/cell (scratch r6_basin*.json, r6_crt*, r6_walk_*):
+- p_hit/restart, true head_A double-and-add: 9-bit 0.0025, 12-bit 0.0017,
+  14-bit ~0.0015 (pooled 5/4400), 15-bit <~0.0008, 16-bit ~0.0007;
+  head_B alias at 14-bit ~0.0004.  MIXED-N rows (actual M5 batch shape,
+  12/14/16-bit): 0.0029 pooled — the best Medium cell.
+  (E1 reference: 0.040 at 9-bit T=1.)
+- Decomposition: T=1 credit at 12-bit gives 0.010, at 14-bit 0.0017 -> the
+  WIDTH of the scored congruence kills most of it; composition (t2) costs a
+  further ~4-16x (9-bit: 0.04 -> 0.0025).  Hamming arithmetic matches: tables
+  within 2 entries of the adder = 277/65536 = 0.42%; observed p_hit ~ that
+  times a convergence factor -> the graded cone is only ~2 entries deep at
+  Medium widths (it was 3-4 deep at 9-bit T=1).
+- Kill-threshold separation is BROKEN at Medium: true-structure best-of-12
+  q10 ~ 0.59 vs junk best-of-12 median 0.618-0.629 (14-bit) -> phase-A kill
+  at 0.62 would gate the true structure out of phase B ~90% of the time.
+  (Kept ENUM_KILL=0.62 anyway: in the linear detection regime R/kill choices
+  are expectation-neutral — see arithmetic below — and Easy behavior must
+  stay identical.)
+- Mitigations MEASURED AND REJECTED (scratch r6_walk_tune, r6_crt,
+  r6_final_basin): sideways moves (0.0006), pair-entry moves (0.0006),
+  low-bit-weighted move score (0.0025 in isolation but 0.0008 through the
+  shipped path — float-compare drift lengthens walks; reverted), CRT
+  factor-decomposed scoring (mod p and mod q separately, 0.002 — the
+  composition, not the score width, dominates at t2), screened inits
+  (768-sample + walk top-12: detect/keval 0.042 ~ 1.5x baseline, not enough).
+- NOT SHIPPED, needs a rules ruling: sqrt-of-label pull-back (factor N, take
+  modular square roots of y to synthesize depth-1 labels) would restore the
+  full T=1 regime (p ~ 0.01-0.04) — but it inverts the HIDDEN MAP in the
+  loss, i.e. injects "the recurrence is squaring".  Judged over the line
+  (R14 task-specific-solver territory) without an explicit ruling; the
+  mod-N-interleave ships because mod-N is family structure, f is not.
+
+### Recalibrated Medium arithmetic (shipped build, plain walk)
+
+evals/restart ~55-75.  MEASURED IN-RUNNER (900s M5-like local smoke, real
+submission, 3 CPU threads): eps 1,265 at W=36/t2 (5.9x the E1 W=22/t1 cost,
+matching the (W/22)^2 * t_min model), 1,446 evals/structure at ladder R=30
+on mixed-N rows (junk survives the 0.62 kill more often on mixed rows), GA
+share 1.6-2.0 s/step, enum tail-reserve pause and eval ladder all clean
+(180 steps, score ~0 at 0.4% coverage — expected).  H100 eps at W=36 t2:
+E1 band 300-800k ev/s x (1265/7300) ~ 52-139k ev/s.
+Medium 600s -> enum ~380-400s -> 2.0-5.6e7 evals -> 14-39k structures
+covered (11-29% of M=132,616); detection/covered ~1-(1-p)^30 ~ 0.084 at
+the mixed-N p=0.0029 (mixed rows rarely gate phase B).  ALIAS COUNT
+(measured, scratch r6_alias_count.py): exactly 4 canonical structures are
+congruence-exact at t2-composed with the standard full-adder table —
+{head_A, head_B} x {doubling slot ALWAYS, TERM-} — plus E1-style
+adapted-table alias classes (init-flipped conventions) with their own
+basins.  Summed detection over the 4 primary classes ~0.23/coverage-pass ->
+P(stage-1 hit) ~ 2.5-7% per attempt; stage 2 + cert complete in-attempt
+once hit (tail reserve 180s >> measured s2 cost at H100 scale).
+6 attempts/day (fresh random order each) -> ~15-35%/day.  Hard 3600s ->
+~15-45%/attempt.  This is the honest post-collapse projection; E1-style
+near-certain single-attempt certification does NOT transfer to Medium under
+rules-safe credits.
+
+### Per-attempt order variation (shipped)
+
+The evaluator pins seed 74, so a constant permutation seed would walk the
+same prefix every attempt.  `_enum_space_init` now mixes wall-clock time at
+construction into the visit-order seed (`ENUM_ORDER_SEED ^ time.time_ns()%2^31`,
+commented as such in-source): answer-blind (a function of run start time,
+never of data/labels/scores), keeps the space and its canonicalization
+data-free, and makes the 6 daily Medium attempts cover fresh random regions
+so their hit probabilities compound.
+
+### Audit flags (rules, round 7 additions)
+
+- `mod_between_steps` executes ONLY inside the training loss path (stage-1
+  curriculum scoring, enum walk, verification); forward/eval execution is
+  untouched and never sees labels or re-injection.  Legality class: label
+  re-expression (congruence-credit precedent) — the interleaved mod-N is the
+  family recurrence structure, not the hidden map.
+- Stage-2 candidate scoring switched to REAL depth-t_min execution + a
+  real-per-row-T verification gate before the s2 buffers are written; both
+  are loss-side computations feeding the established scheduler-adoption
+  parameter transformation.  Strictly stricter than before.
+- Visit-order seed now mixes wall-clock at construction (answer-blind
+  entropy; documented in-source).  The structure space itself stays
+  data-free; buffers unchanged; eval path untouched.
+- REJECTED on rules grounds without a ruling: sqrt-of-label pull-back
+  (would synthesize depth-1 labels by inverting the hidden map — R14
+  task-specific-solver territory).  CRT factoring of N was tested for the
+  walk score only (negative anyway, not shipped).
+- Source ~103 KiB < 256 KiB; port_check ALL PASS on the final build;
+  state elements unchanged (89,898).
+
+### E2E validation at Medium shape (local M5-like dataset, CPU)
+
+Local dataset: data/generated/squaring_mod_local_m5like_b121416_t248 (M5
+geometry, reduced row counts; bits 12/14/16, T{2,4,8}, OOD-T 16, OOD-N
+13/15/18; seed 45).
+- 900s smoke, REAL submission, unmodified runner: mechanics clean end to
+  end (see measured eps/coverage above); no hit expected or observed.
+- Plant run (scratch copy `sub_plant_m5.py` ONLY — true head_A core moved
+  to visit position 10, R forced 1500, kill 0.50, fixed order seed; the
+  shipped file is never planted), 5400s manifest: the blind walk DETECTED
+  the planted core at position 10 under the t2 mod-composed credit on
+  mixed 12/14/16-bit rows (cursor=11, best=1.0000@10, hits=1, verified on
+  all t_min rows, adopted, enum self-paused) — stage 1 fully validated at
+  Medium shape.  Stage-2 outcome: see below.
+- Stage-2 plumbing at Medium shape validated OFFLINE (scratch
+  r6_s2_plumb.py): with the adder core adopted into a chain and one loop
+  window containing the exact SUB id, forward+loss recorded s2_hit with
+  bank tid1 = [0,3,2,0,3,1,0,3] (real-t2 scoring + real-per-row-T
+  verification both passed) — the E1-proven completion machinery carries
+  to Medium unchanged.
+
+### First Medium target: M5, then M3
+
+M5 (12/14/16-bit, T{2,4,8}): t_min=2, mixed-N rows measure the BEST basin
+(0.0029); 16-bit rows still contribute (composition keeps W=36).  M3
+(11/13/15-bit, fixed T=2) is the close second (all 256 batch rows at t_min;
+slightly smaller moduli; expect similar-or-better p_hit).  M1/M2 (t_min=4)
+and M4 (t_min=8): composed credit is sound there but the basin shrinks with
+composition depth — not viable targets until the basin problem is solved.
