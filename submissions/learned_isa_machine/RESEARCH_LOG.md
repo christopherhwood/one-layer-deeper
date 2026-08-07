@@ -549,13 +549,27 @@ geometry, reduced row counts; bits 12/14/16, T{2,4,8}, OOD-T 16, OOD-N
   the planted core at position 10 under the t2 mod-composed credit on
   mixed 12/14/16-bit rows (cursor=11, best=1.0000@10, hits=1, verified on
   all t_min rows, adopted, enum self-paused) — stage 1 fully validated at
-  Medium shape.  Stage-2 outcome: see below.
+  Medium shape.  Stage 2 CONVERGED BUT RAN OUT OF CPU BUDGET: train loss
+  71.3 (step 100) -> 3.17 (step 200) -> 1.53 final at 204 steps/5,420s
+  (solved level is ~0.02); eval scored a GA chain (0.4%) because the core
+  chain was still incomplete — correct best-chain behavior.  Step-cost
+  decomposition (profiled): plant-only R=1500 enum steps ~85s + stage-2
+  loop-sweep steps 16-22s; a loop sweep (27.7k programs, 24 rows) costs
+  18.6s at W=36/t2 vs 8.2s at E1 shape (2.3x) on 3 CPU threads — on H100
+  it is a single <=65k-program call (~0.5-2s), so the ~90-190 stage-2
+  steps to completion are 1-4 min, inside the tail reserve.
+  ENUM_TAIL_RESERVE raised 180 -> 240s so a late in-budget hit still
+  converts.  A 10,800s plant rerun is in flight (m5_plant10800.log) to
+  demonstrate in-run completion + rung certification on CPU.
 - Stage-2 plumbing at Medium shape validated OFFLINE (scratch
   r6_s2_plumb.py): with the adder core adopted into a chain and one loop
   window containing the exact SUB id, forward+loss recorded s2_hit with
   bank tid1 = [0,3,2,0,3,1,0,3] (real-t2 scoring + real-per-row-T
   verification both passed) — the E1-proven completion machinery carries
   to Medium unchanged.
+- Affine 60s probe, FINAL build, clean CPU: mean_exact_accuracy 1.0 in
+  both runs (60 and 70 steps; a mid-session 2% reading was a CPU-
+  contention artifact — 17 steps — while the plant run owned the box).
 
 ### First Medium target: M5, then M3
 
