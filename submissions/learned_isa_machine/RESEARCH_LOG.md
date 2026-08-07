@@ -89,14 +89,36 @@ room; (3) stage 2 becomes an exact enumeration (~20k candidates, seconds) — th
 exhaustive check showed the canonical conditional-subtract pair is the global-optimum
 completion over ALL 65,536 tables.
 
-## In flight
+## MILESTONE (2026-08-06): first complete certified program discovered end-to-end
 
-- Affine end-to-end validation: revised stage-1 credit (congruence + range bonus,
-  reserved slots) -> GA -> stage-2 tier-1 enumeration -> full certification (exactness
-  at T in {1,2,3,6}, C2 necessity, width robustness). If it lands, this is the first
-  complete program discovered from endpoint-only credit in this machine.
-- Round 4 (squaring core): M1 quality-diversity (MAP-Elites); M2 template enumeration +
-  conditional table learning with H100 feasibility estimate.
+Affine (3x+1 mod 323), endpoint-only credit, random init: stage 1 (GA, congruence +
+0.15*range-bonus, slots 6-7 reserved) found a congruence-exact core in 22 generations /
+5,633 evals / 20 s (1/4 seeds); stage 2 (tier-1 conditional-subtract enumeration, 30,912
+candidates, 645 s) produced 30 complete programs. Winner certified: exact on ALL 323 x at
+T in {1,2,3,6}; width-robust (W=24, 30); necessity sweep 41 fully load-bearing fields,
+every active slot counterfactually necessary. The modular reducer EMERGED as two
+TERM-gated subtract slots. Novel construction, not the reference. Total ~503k evals /
+~36 min on one shared CPU worker. Artifacts: scratchpad sa_logs/round4_affine_complete.txt.
+
+## Round 4 (squaring core) — QD ruled out; two-level enumeration is the path
+
+- MAP-Elites QD: FINAL negative (657 iters / 338k evals, best congruence 0.688, no cell
+  >= 0.70). Stepping stones do not exist under per-row credit for multiplication.
+- Template enumeration + conditional table learning: mechanism VALIDATED — given the true
+  2-slot structure, exhaustive table mapping shows a graded cone around the working ADD
+  table; randomized steepest descent detects it at ~2.3-7k evals/structure (R95 ~ 94
+  restarts). The blinded 800-structure test under-budgeted restarts (R=32; true structure
+  ranked 144). Calibrated full cost: 8.3M two-active-slot structures x ~6.9k evals ~ 5.8e10
+  machine evals — H100 Hard-budget territory before pruning (MDL order, canonicalization,
+  early-kill all individually validated).
+
+## In flight / next
+
+1. CPU-scale proof of the complete squaring pipeline (pruned structure space, R~94 table
+   restarts, then the validated stage-2 reducer enumeration).
+2. The port: rules-compatible submission.py — enumeration + exact marginalization in the
+   loss with per-structure table adaptation; validate end-to-end on the affine probe
+   manifest first.
 - Round 4 (squaring core, search-structure levers): M1 quality-diversity (MAP-Elites
   archive over behavior descriptors — stepping stones instead of fitness-only
   selection); M2 MDL-ordered template enumeration with conditional per-entry table
