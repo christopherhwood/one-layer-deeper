@@ -1536,7 +1536,7 @@ class Model(nn.Module):
             0, 4, (n * ra, 8), generator=self._enum_rng
         ).to(device)
         tabs, cong = self._enum_steepest(
-        f_a, t_a, xs_s, ns_s, y_s, width, t_comp
+            f_a, t_a, xs_s, ns_s, y_s, width, t_comp
         )
         cong = cong.view(n, ra)
         j = cong.argmax(dim=1)
