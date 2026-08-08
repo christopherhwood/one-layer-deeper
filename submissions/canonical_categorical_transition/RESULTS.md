@@ -1,71 +1,91 @@
-# Canonical categorical transition machine
+# Generic categorical cellular recurrence
 
-This experiment directly instantiates the positive endpoint-identification
-theorem. Every state that persists between local updates is a decimal-digit
-distribution plus a 16-way categorical controller. One 54,491-element model
-cell is reused across digit positions, learned product-significance columns,
-and outer square applications. Digit outputs are straight-through
-canonicalized and become the next square's input through an identity decoder.
+## Rule-safety boundary
 
-The model has no continuous latent tape, position-specific transition, learned
-outer decoder, hard-coded digit product, carry, quotient, comparison, or
-reduction rule. A small label-free mutual-information term sharpens and
-balances controller states. The only task labels are evaluator endpoints.
+This candidate is the rule-safe successor to the constructive categorical
+endpoint proof. Its `forward` contains no multiplication, modular reduction,
+comparison, carry/borrow, digit-product table, squaring branch, or
+recurrence-specific transition. It parses `N`, `x`, and `T`, then applies one
+randomly initialized, translation-equivariant learned cell repeatedly. The
+only persistent mutable state is a distribution over decimal digits plus a
+16-way categorical controller.
 
-## Contract and fixed-modulus smoke
+This distinction matters for the private-task warning that Hard may change the
+recurrence. Earlier arithmetic interpreters could execute repeated squaring
+perfectly, but they hard-coded the known algorithm and are not admissible Hard
+candidates. This model can represent other local recurrent programs, but must
+discover them from endpoint supervision.
 
-Python compilation, official source validation, model/optimizer validation,
-finite training, ordinary evaluation, and the complete depth evaluator passed.
-The ten-second fixed-modulus smoke completed 496 batch-128 updates.
+## Local evidence
 
-| split | exact | token | last token |
-|---|---:|---:|---:|
-| test | 18.3333% | 30.71% | 35.00% |
-| OOD-T | 13.0000% | 20.75% | 20.00% |
-| aggregate / mean | **15.6667%** | **25.73%** | **27.50%** |
+Two complete width sweeps gave the best balance between computation per
+example and optimizer updates per minute.
 
-The matched product-ripple batch-128 control reached 17.50% exact, 35.41%
-token, and 39.00% last-token accuracy. The categorical machine is trainable but
-does not improve the small task.
+| variable-modulus E5 CPU, 60 s | updates | ID exact | OOD-N exact | mean |
+|---|---:|---:|---:|---:|
+| 1 sweep | 2,312 | 0.50% | 0.00% | 0.25% |
+| **2 sweeps** | **1,281** | **1.00%** | **0.67%** | **0.83%** |
+| 4 sweeps | 768 | 0.42% | 1.00% | 0.71% |
 
-## Variable-modulus gates
+The two-sweep version also passed the fixed-modulus ten-second smoke with
+13.67% mean exact accuracy after 1,000 updates.
 
-| gate | updates | exact | token | last token | seen-N T=1 | OOD-N T=1 token |
-|---|---:|---:|---:|---:|---:|---:|
-| 15 seconds | 202 | 0.3750% | **15.97%** | 11.17% | 0.1953% | 17.07% |
-| 60 seconds | 821 | 0.4167% | 14.35% | 8.83% | 0.3906% | 16.01% |
+To test recurrence flexibility rather than squaring-specific fit, the same
+four-sweep cell was trained on a generated hidden recurrence
+`state <- 3*state + 1 (mod N)` without changing the model source. It reached
+5.33% held-out exact after ten seconds and 4.00% after sixty seconds, but 0%
+on unseen depth T=6. Thus the architecture can learn signal from a changed
+rule, while compositional depth generalization remains unsolved.
 
-At 15 seconds, the ordinary token score exceeds the exact batch-128 control's
-15.01%, while OOD-N T=1 remains near its 17.23% signal. That justified the
-longer coverage test. The 60-second result is decisive in the opposite
-direction: relaxed accuracy declines, OOD-N T=1 has zero exact examples, and
-its token accuracy loses 1.06 points.
+## Hosted H100 evidence
 
-Canonical state and tied computation are therefore necessary ingredients of
-the positive theorem but are not sufficient on this dataset. The unobserved
-categorical controller and local transition table are not distinguished by the
-available endpoint examples; straight-through selection commits to one of
-many endpoint-compatible paths. This candidate does not warrant H100.
+| tier/data | sweeps | updates | ID exact | OOD exact | score | submission |
+|---|---:|---:|---:|---:|---:|---|
+| Easy E5 | 4 | 573 / 60 s | 0.30% | 0.30% | 0.30% | `53a90f83` |
+| **Easy E5** | **2** | **1,259 / 60 s** | **0.80%** | **1.00%** | **0.92%** | `5c100c75` |
+| Hard H1 | 2 | 23,043 / 3,600 s | 0.10% | 0.00% OOD-T, 0.10% OOD-N-T | 0.05% | `6f255767` |
 
-## Constructive endpoint-only proof experiment
+The two-sweep Easy run is the strongest rule-safe learned-recurrence result in
+this repository so far. Training exact accuracy rose to 3.9%, and its hosted
+ID/OOD result closely reproduced the local gate.
 
-`proof_endpoint_identification.py` tests the theorem independently of the
-benchmark's state-coverage limitation. A randomly initialized categorical
-transition table is trained only on all bounded T=1 endpoints
-`(x, N) -> x^2 mod N` for `2 <= N <= 31`. Every deeper rollout is held out.
+## What the first Hard run actually found
 
-| T=1 state coverage | covered / total | all T=1 | withheld T=1 | T=2..64 |
-|---|---:|---:|---:|---:|---:|
-| exhaustive | 495 / 495 | **100%** | n/a | **100% at every rung** |
-| 60% control | 297 / 495 | 62.63% | 6.57% | 45.45% at T=2, about 34% thereafter |
+The Hard trace stayed at 0% training exact for the entire hour and its loss
+remained near the uniform-token baseline. Inspection found a real connectivity
+bug: training executed at most eight outer recurrence steps. For a labelled
+row with T greater than eight, no iteration ever selected that row's terminal
+state, so its supervised logits remained a constant zero tensor. Easy E5 uses
+only T=1/2/3 and could not expose the bug.
 
-The exhaustive result is the constructive positive proof in executable form:
-endpoint-only T=1 labels identify the reusable canonical transition, and
-induction gives perfect unseen recurrence depths. The partial control isolates
-the missing challenge premise. Canonical recurrence cannot infer transition
-rows that neither the data nor a compact shared rule distinguish.
+The cap is now removed. Training rolls each batch through its actual maximum
+T, up to the evaluator-supported 64. A regression test replaces the learned
+cell with a counting differentiable transition and verifies that a T=16 row:
 
-The next credible architecture must reduce the effective one-step hypothesis
-class enough that the available variable-modulus endpoints form a teaching
-set. Merely discretizing or canonicalizing a still-flexible reducer does not do
-that.
+1. executes exactly 16 outer transitions;
+2. produces endpoint logits connected to a trainable parameter; and
+3. propagates a nonzero endpoint gradient.
+
+Consequently, the 0.05% Hard result is evidence against the capped artifact,
+not a clean falsification of the generic categorical architecture or the
+positive identifiability theorem. The uncapped artifact still needs a new Hard
+run after the daily quota resets. Its expected cost is substantially lower
+throughput on batches whose maximum T is large, but unlike the first run it
+will receive the intended endpoint learning signal.
+
+## Remaining gap
+
+Removing the cap repairs supervision; it does not prove that optimization will
+discover a reusable transition. The altered-rule probe still failed at unseen
+depth, and no run has certified T=1. The next decisive evidence is therefore:
+
+- uncapped Hard training must move below the uniform-loss plateau and produce
+  nonzero training exact accuracy;
+- T=1 must improve before deeper recurrence can be credited to composition;
+- accuracy must then decay slowly, rather than collapse immediately, with T;
+- OOD-N must track ID closely enough to indicate a shared learned program.
+
+If the repaired run learns T=1 but not larger T, the next architectural change
+should target stable recurrent composition. If it still cannot learn T=1, the
+remaining problem is one-step program identification from sparse endpoints,
+not recurrence depth.

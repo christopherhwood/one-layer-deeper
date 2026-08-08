@@ -1,16 +1,17 @@
-"""Canonical categorical transition machine for repeated modular squaring.
+"""Canonical categorical cellular program for a hidden recurrence.
 
 The model turns the positive endpoint-identification argument into an explicit
 architecture.  The state that survives every local update contains only a
 distribution over the ten observable decimal digits and a small categorical
-controller.  One translation-equivariant cell updates that state everywhere,
-for every product-evidence column, and for every outer square.  The digit state
-is straight-through canonicalized and is itself the next square's input, so no
+controller. One translation-equivariant cell updates that state everywhere and
+at every recurrence depth. The digit state
+is straight-through canonicalized and is itself the next recurrence input, so no
 free decoder can hide a non-reusable endpoint code.
 
-Digit-pair evidence is learned and merely grouped by positional significance.
-No digit product, carry, quotient, comparison, or modular-reduction transition
-is fixed.  Training uses evaluator endpoint labels plus label-free categorical
+The cell receives only neighboring categorical states, immutable prompt digit
+registers, boundary flags, and a generic learned clock. No digit product,
+arithmetic operation, carry, quotient, comparison, or reduction transition is
+fixed. Training uses evaluator endpoint labels plus label-free categorical
 sharpness/balance terms.  All trainable state is randomly initialized.
 """
 
@@ -41,9 +42,8 @@ DIGIT_OFFSET = 7
 NUM_DIGITS = 10
 CONTROL_STATES = 16
 HIDDEN = 64
-MICRO_STEPS = 2
+COMPUTE_SWEEPS = 2
 MAX_OUTER_STEPS = 64
-TRAIN_OUTER_STEPS = 3
 BASE_LR = 2.0e-3
 PHASE_WEIGHT = 0.25
 CONTROLLER_MI_WEIGHT = 0.01
@@ -84,7 +84,7 @@ class CategoricalCell(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         local_width = 3 * (NUM_DIGITS + CONTROL_STATES)
-        context_width = 2 * NUM_DIGITS + HIDDEN + 2 + 4
+        context_width = 3 * NUM_DIGITS + HIDDEN + 2 + 4
         self.input = nn.Linear(local_width + context_width, 2 * HIDDEN)
         self.norm = RMSNorm(2 * HIDDEN)
         self.body = nn.Sequential(
@@ -110,7 +110,8 @@ class CategoricalCell(nn.Module):
         controller: Tensor,
         source: Tensor,
         modulus: Tensor,
-        column: Tensor,
+        original: Tensor,
+        clock: Tensor,
         boundary: Tensor,
         phase: Tensor,
         temperature: float,
@@ -129,7 +130,8 @@ class CategoricalCell(nn.Module):
                 right_control,
                 source,
                 modulus,
-                column[:, None].expand(-1, width, -1),
+                original,
+                clock[:, None].expand(-1, width, -1),
                 boundary.expand(batch, -1, -1),
                 phase[:, None].expand(-1, width, -1),
             ),
@@ -155,46 +157,24 @@ class CategoricalCell(nn.Module):
         )
 
 
-class CanonicalSquare(nn.Module):
-    """One square as repeated application of one finite local transition."""
+class CanonicalProgram(nn.Module):
+    """One recurrence step executed by one generic finite local program."""
 
     def __init__(self, width: int) -> None:
         super().__init__()
         self.width = width
-        self.columns = 2 * width - 1
-        self.pair_embedding = nn.Parameter(
-            torch.empty(NUM_DIGITS, NUM_DIGITS, HIDDEN)
+        self.compute_steps = COMPUTE_SWEEPS * width
+        self.clock_embedding = nn.Parameter(
+            torch.empty(COMPUTE_SWEEPS, HIDDEN)
         )
-        nn.init.normal_(self.pair_embedding, std=HIDDEN**-0.5)
-        self.column_norm = RMSNorm(HIDDEN)
+        nn.init.normal_(self.clock_embedding, std=HIDDEN**-0.5)
         self.cell = CategoricalCell()
-
-    def _product_columns(self, register: Tensor) -> Tensor:
-        batch = register.shape[0]
-        pair_features = torch.einsum(
-            "bid,bje,deh->bijh", register, register, self.pair_embedding
-        )
-        positions = torch.arange(self.width, device=register.device)
-        significance = (positions[:, None] + positions[None, :]).reshape(
-            1, self.width * self.width, 1
-        )
-        significance = significance.expand(batch, -1, HIDDEN)
-        columns = torch.zeros(
-            batch,
-            self.columns,
-            HIDDEN,
-            device=register.device,
-            dtype=pair_features.dtype,
-        )
-        columns = columns.scatter_add(
-            1, significance, pair_features.reshape(batch, -1, HIDDEN)
-        )
-        return self.column_norm(columns)
 
     def forward(
         self,
         register: Tensor,
         modulus: Tensor,
+        original: Tensor,
         temperature: float,
         hardness: float,
     ) -> tuple[
@@ -205,7 +185,6 @@ class CanonicalSquare(nn.Module):
         Tensor,
     ]:
         batch = register.shape[0]
-        product = self._product_columns(register)
         digits = register / register.sum(dim=-1, keepdim=True).clamp_min(1e-6)
         controller = torch.zeros(
             batch,
@@ -225,44 +204,42 @@ class CanonicalSquare(nn.Module):
         controller_soft_states: list[Tensor] = []
         digit_soft_states: list[Tensor] = []
         digit_logits = digits.clamp_min(1e-6).log()
-        for order, column_index in enumerate(
-            range(self.columns - 1, -1, -1)
-        ):
-            first_column = float(order == 0)
-            last_column = float(column_index == 0)
-            for micro_step in range(MICRO_STEPS):
-                phase = torch.tensor(
-                    (
-                        first_column,
-                        last_column,
-                        float(micro_step == 0),
-                        float(micro_step == 1),
-                    ),
-                    device=register.device,
-                    dtype=register.dtype,
-                )[None].expand(batch, -1)
+        for step in range(self.compute_steps):
+            sweep = step // self.width
+            within_sweep = step % self.width
+            phase = torch.tensor(
                 (
-                    digits,
-                    controller,
-                    digit_logits,
-                    _,
-                    digit_soft,
-                    controller_soft,
-                ) = self.cell(
-                    digits,
-                    controller,
-                    register,
-                    modulus,
-                    product[:, column_index],
-                    boundary,
-                    phase,
-                    temperature,
-                    hardness,
-                )
-                controller_soft_states.append(controller_soft)
-                digit_soft_states.append(digit_soft)
-                if column_index == 0:
-                    phases.append(digit_logits)
+                    float(step == 0),
+                    float(step + 1 == self.compute_steps),
+                    float(within_sweep == 0),
+                    float(within_sweep + 1 == self.width),
+                ),
+                device=register.device,
+                dtype=register.dtype,
+            )[None].expand(batch, -1)
+            (
+                digits,
+                controller,
+                digit_logits,
+                _,
+                digit_soft,
+                controller_soft,
+            ) = self.cell(
+                digits,
+                controller,
+                register,
+                modulus,
+                original,
+                self.clock_embedding[sweep][None].expand(batch, -1),
+                boundary,
+                phase,
+                temperature,
+                hardness,
+            )
+            controller_soft_states.append(controller_soft)
+            digit_soft_states.append(digit_soft)
+            if within_sweep + 1 == self.width:
+                phases.append(digit_logits)
 
         return (
             digits,
@@ -281,7 +258,7 @@ class Model(nn.Module):
         self.config = Config(spec.vocab_size, spec.max_seq_len)
         self.max_length = spec.max_seq_len
         self.width = max(2, (spec.max_seq_len - 5) // 2)
-        self.square = CanonicalSquare(self.width)
+        self.program = CanonicalProgram(self.width)
         self.training_temperature = 1.25
         self.eval_temperature = 0.20
         self.canonical_hardness = 0.15
@@ -393,18 +370,18 @@ class Model(nn.Module):
             attention_mask = input_ids != PAD
         valid = attention_mask.bool()
         modulus, register, t_values = self._parse(input_ids, valid)
-        loops = (
-            TRAIN_OUTER_STEPS
-            if self.training
-            else int(t_values.max().item())
-        )
+        original = register
+        # Every labelled endpoint must actually be reached.  Capping this
+        # rollout silently disconnects rows with larger T from the supervised
+        # loss: their terminal logits remain the constant zero tensor.
+        loops = int(t_values.max().item())
         temperature = (
             self.training_temperature if self.training else self.eval_temperature
         )
         hardness = self.canonical_hardness if self.training else 1.0
 
         terminal_logits = torch.zeros_like(register)
-        first_phases: tuple[Tensor, ...] = ()
+        terminal_phases = [torch.zeros_like(register) for _ in range(COMPUTE_SWEEPS)]
         first_controller: Tensor | None = None
         first_digit_soft: Tensor | None = None
         for outer_step in range(loops):
@@ -419,32 +396,38 @@ class Model(nn.Module):
                 phases,
                 controller_soft,
                 digit_soft,
-            ) = self.square(
+            ) = self.program(
                 transition_input,
                 modulus,
+                original,
                 temperature,
                 hardness,
             )
             if outer_step == 0:
-                first_phases = phases
                 first_controller = controller_soft
                 first_digit_soft = digit_soft
             terminal = (t_values == outer_step + 1)[:, None, None]
             terminal_logits = torch.where(
                 terminal, candidate_logits, terminal_logits
             )
+            terminal_phases = [
+                torch.where(terminal, phase, previous)
+                for phase, previous in zip(
+                    phases, terminal_phases, strict=True
+                )
+            ]
             active = (t_values > outer_step)[:, None, None]
             register = torch.where(active, candidate, register)
 
         if first_controller is None or first_digit_soft is None:
-            raise RuntimeError("at least one square is required")
+            raise RuntimeError("at least one recurrence step is required")
         lengths = valid.sum(dim=1)
         logits = self._place_logits(
             terminal_logits, lengths, prompt_length
         )
         phase_logits = tuple(
             self._place_logits(phase, lengths, prompt_length)
-            for phase in first_phases
+            for phase in terminal_phases
         )
         return logits, {
             "t_values": t_values,
@@ -493,10 +476,9 @@ def token_training_loss(batch: TokenLossBatch) -> Tensor:
         / endpoint_mask.sum().clamp_min(1.0)
     )
 
-    t1_mask = (t_values == 1)[:, None] & valid
     phase_terms = [
         _masked_loss(
-            _target_aligned(full_logits, batch), batch.labels, t1_mask
+            _target_aligned(full_logits, batch), batch.labels, valid
         )
         for full_logits in batch.auxiliary["phase_logits"]
     ]
