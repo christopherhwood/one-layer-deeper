@@ -5,7 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 candidate="submissions/generic_integer_isa/submission.py"
-expected_sha="87f8beed1c44ae168c30c41e1745c1adec02840b5dbc280aaa93c8b0a82f7636"
+expected_sha="81e257f755cd14975208accc6e4157d109d2e040c19668b6493c7b19ceff31a3"
 actual_sha="$(shasum -a 256 "$candidate" | awk '{print $1}')"
 
 if [[ "$actual_sha" != "$expected_sha" ]]; then

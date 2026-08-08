@@ -68,12 +68,14 @@ File: `submissions/generic_integer_isa/submission.py`
 
 SHA-256:
 
-`87f8beed1c44ae168c30c41e1745c1adec02840b5dbc280aaa93c8b0a82f7636`
+`81e257f755cd14975208accc6e4157d109d2e040c19668b6493c7b19ceff31a3`
 
 Candidate C removes Candidate B's automatic modular reduction. It learns five
 instructions from a generic sixteen-operation integer calculator containing
 ordinary arithmetic, divide/remainder, bitwise, min/max, and load operations.
 Remainder by N must be explicitly discovered as part of the global program.
+The complete program space is generated algebraically during training; no
+complete program table or winning ticket is stored in model state.
 
 Verified evidence:
 
@@ -81,8 +83,8 @@ Verified evidence:
 - all 80 instruction logits receive finite nonzero endpoint gradients;
 - fixed square, cube, affine, and `x^2+x+2`: 100%;
 - exact M5-shaped CPU gate: 100%, including both T=64 ladders;
-- hosted Easy E5: 100%, seen-N T=64, OOD-N T=64, 2,066 updates
-  (`36497520-7fcc-4188-b0e2-5760e8acddd6`).
+- hosted Easy E5: 100%, seen-N T=64, OOD-N T=64, 1,084 updates
+  (`ab91d314-440b-4d1d-b379-1e2216cb5284`).
 
 This is now the recommended scoring artifact because it preserves perfect
 performance while making the supplied architecture materially more general.

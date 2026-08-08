@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 
-from benchmark import ModelSpec
+from benchmark import ModelSpec, OptimizerSpec
 
 
 PATH = (
@@ -30,13 +30,19 @@ class GenericIntegerIsaTest(unittest.TestCase):
             for slot, choice in enumerate(choices):
                 self.model.instruction_logits[slot, choice] = 10.0
 
-    def test_complete_space_and_wrong_initial_map(self) -> None:
-        self.assertEqual(tuple(self.model.programs.shape), (1_048_576, 5))
-        initial = self.model.programs[
-            self.model._program_log_weights().argmax()
-        ].tolist()
+    def test_complete_generated_space_and_wrong_initial_map(self) -> None:
+        self.assertEqual(MODULE.PROGRAMS, 1_048_576)
+        self.assertEqual(list(self.model.buffers()), [])
+        initial = self.model.instruction_logits.argmax(dim=-1).tolist()
         self.assertEqual(initial, [14, 2, 9, 13, 0])
         self.assertNotEqual(initial, [3, 9, 0, 0, 0])
+
+        index = torch.arange(MODULE.PROGRAMS)
+        generated = torch.stack(
+            [self.model._choice(index, slot) for slot in range(MODULE.SLOTS)],
+            dim=1,
+        )
+        self.assertEqual(int(torch.unique(generated, dim=0).shape[0]), MODULE.PROGRAMS)
 
     def test_explicit_modulo_programs_cover_changed_recurrences(self) -> None:
         modulus = torch.tensor([323, 437])
@@ -72,6 +78,14 @@ class GenericIntegerIsaTest(unittest.TestCase):
             )
             self.assertTrue(torch.equal(actual, expected), kind)
 
+    def test_reduction_is_not_automatic(self) -> None:
+        self._select([3, 0, 0, 0, 0])
+        source = torch.tensor([29])
+        modulus = torch.tensor([323])
+        actual = self.model._execute_map(source, modulus, torch.tensor([1]))
+        self.assertEqual(actual.tolist(), [29 * 29])
+        self.assertGreater(int(actual.item()), int(modulus.item()))
+
     def test_endpoint_gradient_reaches_all_instruction_logits(self) -> None:
         source = torch.tensor([17, 29, 41])
         modulus = torch.tensor([323, 437, 667])
@@ -87,6 +101,28 @@ class GenericIntegerIsaTest(unittest.TestCase):
         self.assertIsNotNone(gradient)
         self.assertTrue(torch.isfinite(gradient).all())
         self.assertEqual(int((gradient != 0).sum()), MODULE.SLOTS * MODULE.CHOICES)
+
+    def test_optimizer_owns_every_trainable_value_exactly_once(self) -> None:
+        parameters = list(self.model.parameters())
+        self.assertEqual(len(parameters), 1)
+        self.assertIs(parameters[0], self.model.instruction_logits)
+        self.assertEqual(sum(parameter.numel() for parameter in parameters), 80)
+        bundle = MODULE.build_optimizer(
+            self.model, OptimizerSpec(60.0, "cpu")
+        )
+        optimized = [
+            parameter
+            for group in bundle.optimizer.param_groups
+            for parameter in group["params"]
+        ]
+        self.assertEqual(len(optimized), 1)
+        self.assertIs(optimized[0], self.model.instruction_logits)
+
+    def test_source_has_no_offload_or_participant_backward(self) -> None:
+        source = PATH.read_text()
+        self.assertNotIn(".cpu(", source)
+        self.assertNotIn(".backward(", source)
+        self.assertNotIn("autograd.grad", source)
 
 
 if __name__ == "__main__":

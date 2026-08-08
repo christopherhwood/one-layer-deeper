@@ -65,10 +65,13 @@ class Model(nn.Module):
         self.instruction_logits = nn.Parameter(
             torch.randn(SLOTS, CHOICES) * 0.02
         )
-        axes = [torch.arange(CHOICES) for _ in range(SLOTS)]
-        self.register_buffer(
-            "programs", torch.cartesian_prod(*axes), persistent=True
-        )
+
+    @staticmethod
+    def _choice(program_index: Tensor, slot: int) -> Tensor:
+        divisor = CHOICES ** (SLOTS - slot - 1)
+        return torch.div(
+            program_index, divisor, rounding_mode="floor"
+        ).remainder(CHOICES)
 
     @staticmethod
     def _parse_number(input_ids: Tensor, mask: Tensor) -> Tensor:
@@ -100,8 +103,13 @@ class Model(nn.Module):
 
     def _program_log_weights(self) -> Tensor:
         fields = F.log_softmax(self.instruction_logits, dim=-1)
-        slots = torch.arange(SLOTS, device=fields.device)[:, None]
-        return fields[slots, self.programs.T].sum(dim=0)
+        program_index = torch.arange(PROGRAMS, device=fields.device)
+        log_weights = fields.new_zeros(PROGRAMS)
+        for slot in range(SLOTS):
+            log_weights = log_weights + fields[
+                slot, self._choice(program_index, slot)
+            ]
+        return log_weights
 
     @staticmethod
     def _instruction(
@@ -136,6 +144,7 @@ class Model(nn.Module):
     def _execute_programs(
         self, source: Tensor, modulus: Tensor, depth: int
     ) -> Tensor:
+        program_index = torch.arange(PROGRAMS, device=source.device)
         state = source[None].expand(PROGRAMS, -1)
         modulus_full = modulus[None].expand_as(state)
         for _ in range(depth):
@@ -145,14 +154,14 @@ class Model(nn.Module):
                     state,
                     previous,
                     modulus_full,
-                    self.programs[:, slot, None],
+                    self._choice(program_index, slot)[:, None],
                 )
         return state
 
     def _execute_map(
         self, source: Tensor, modulus: Tensor, time_steps: Tensor
     ) -> Tensor:
-        selected = self.programs[self._program_log_weights().argmax()]
+        selected = self.instruction_logits.argmax(dim=-1)
         state = source
         terminal = torch.zeros_like(source)
         for outer_step in range(int(time_steps.max().item())):
