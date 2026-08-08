@@ -596,3 +596,104 @@ After an unauthorized, crashed Hard attempt consumed a fresh daily slot, the own
 permanently forbidden Hard-tier submissions by the agent. presubmit_gate.sh hard-refuses
 the tier. Hard attempts, if any, are made manually by the owner only. All agents working
 in this repo must honor this without exception.
+
+## Round 8 (2026-08-08): H100 enum throughput — kernel-launch consolidation (+Hard-shape hardening)
+
+Diagnosis (TorchDispatchMode launch-op counting at M5 shape, W=36/t2, 48
+rows): one cap-sized enum walk call through the generic executor costs
+47,610 launch-class aten ops (view ops excluded).  At 20-30 us/launch on
+H100 that is 0.95-1.4 s per 65,536-eval call — a 45-65k evals/s
+launch-bound ceiling, which is exactly the hosted band (52-139k).  The
+generic schedule pays (live slot-entries x segments x width) subset passes
+of ~14 kernels per LUT chunk; the walk pays that 26x per chunk step.
+
+Changes (every path BIT-EXACT vs the round-7 build; validated below):
+1. execute_pairs — dedicated walk executor for the enum program class
+   (2 active slots, own table, uniform depth).  One fused heterogeneous
+   pass per program-local micro-step (<= 2+2W passes/T-step; per-pass slot
+   fields, head register/position, predicate masks and dst routing come
+   from precomputed (L,P) index grids; head bit sampled at the iteration's
+   first micro-step and held for a same-segment second slot = reference
+   semantics), whole (chunk,program,row) scan-index grid built in a few
+   wide kernels.  Launch-ops/call 47,610 -> 9,638 (k=4) / 7,933 (k=6):
+   4.9-6.0x.  Full-chunk measurements (n=64, R=30, 82k evals): 1,046,786
+   -> 183,159 launch-ops = 5.7x; launch/eval 12.7 -> 2.22.
+2. Generic executor trimmed the same way (batched chunk grids + static
+   predicate/dst masks): GA exec (256 MAP + 577 alts) 140,724 -> 63,590
+   launch-ops (2.2x); stage-2 loop sweep 46,150 -> 19,412 (2.4x).
+3. Device gating: CUDA runs the batched/pairs kernels; CPU keeps the
+   round-7 subset/chunk-loop kernels (measured ~1.5x faster there — the
+   small per-entry working set stays cache-resident, and the CPU
+   trajectory stays byte-identical).  EXEC_BATCHED / ENUM_PAIRS module
+   flags exist only so tests can force either path on either device.
+4. ENUM_MAX_K_CUDA=6: W=36 scans in 6 chunks instead of 9 on CUDA (LUT
+   bank 4 GiB at P_CAP=65,536; composition transients capped ~1 GB by a
+   16,384-table sliced build).  CPU keeps k=4.
+5. Chunk controller (CUDA only): first chunk 768, floor 192, initial eps
+   guess 60k — per-call cost is ~flat in P, so tiny warm-up chunks would
+   poison the cumulative measured eval rate the controller feeds on.  CPU
+   controller identical to round 7.
+
+Hard-shape (H1 replica) derisk, after the hosted H1 EVALUATION_FAILED:
+- Local replica datasets squaring_mod_local_h1like_n26_{t4816,t81632}
+  (fixed 26-bit semiprime 8179*8191, T-sets {4,8,16}/{8,16,32}, OOD-N
+  depth moduli 27/29-bit).  KEY SHAPE FACT: 27+-bit OOD-N moduli have 9+
+  decimal digits, pushing max_seq_len to 22-23 -> decimal_width 9 ->
+  UNCLAMPED width_max = 66 > int64.  In the round-7 build a >=30-bit eval
+  batch then computes width 64 masks ((1<<64)-1 wraps to -1) and
+  _bits_onehot shifts by >= 64 (undefined) — silent corruption on this
+  torch build, potentially a hard EVALUATION-phase failure on the hosted
+  stack.  FIX: width_max = min(2*value_bits+4, 62) — no effect at any
+  <= 60-bit shape (E1-E5, M1-M5 all dw <= 8); >= 30-bit moduli degrade to
+  tape truncation instead of UB.
+- .float() before the CPU multinomial in both stage-2 sweeps (the hosted
+  runtime is bf16 autocast; CPU bf16 multinomial support is
+  torch-version-dependent).
+- Audited clean at W=56/58/62: SWAR popcount (verified against naive to
+  62 bits), LUT chunking k4/k6/k8 offsets, take() index magnitudes,
+  eval executor to T=64, composition t_comp=4/8, loop sweep at W=56 t8.
+
+Validation (all PASS):
+- fast_check.py: execute_pairs (k4 AND k6) vs round-7 executor on a
+  stratified sample covering all 10 (lm0,lm1) signature classes x random
+  tables at W=22/t1, W=22/t3, W=36/t2, W=36/t3 (mod-interleaved);
+  trimmed generic (batched AND loop variants) vs round-7 on reference +
+  60 random 8-slot programs, mixed per-row T, mod on/off, return_state.
+- _enum_chunk END-TO-END equivalence (n=48, R=30, same RNG): cursor,
+  eval count, best score/position, finalist tables and outputs IDENTICAL
+  to round 7 for cpu-default, pairs-k4 and pairs-k6 variants at E1 and
+  M5 shapes.
+- hard_check.py: everything in the Hard-shape list above, bit-exact vs
+  the round-7 executor and reference_machine; dw=9 model builds, eval
+  forward at 26/29/30-bit N, train step at W=56 t_min=4 with enum on,
+  loop sweep at W=56 t8 — no crashes.
+- port_check.py suite: ALL PASS.  client.cli validate: valid (~117 KB).
+- Runner, clean CPU: affine 60 s x2 -> mean_exact_accuracy 1.0 BOTH
+  (the GA layer is bit-identical on CPU); E1 600 s smoke clean (486
+  steps, eps 6,689 ~ baseline 7,264, no hit expected); M5-like 900 s
+  smoke: 185 steps, eps 1,242 at step 50 vs 1,240 baseline, ga_s 1.71 vs
+  1.74, cursor 322 vs 325 -- the CPU trajectory is the round-7 one;
+  H1-replica 420 s runs CRASH-FREE end-to-end at both depths: t_min=4 ->
+  39 steps (10.8 s/step at W=56), eval 21.3 s incl. the 27/29-bit OOD-N
+  ladders; t_min=8 -> 22 steps (~20 s/step; composition cost ~2x t4, as
+  modeled), eval 15.8 s.  Score 0 as expected (crash-freedom runs).
+- State elements unchanged; no new buffers; eval path semantics
+  untouched (executor rewrites are bit-exact).
+
+H100 projection (20-30 us/launch + ~2 TB/s memory model, W=36/t2):
+- pairs k=6 cap call: 7,933 launches = 0.16-0.24 s + ~0.1 s memory ->
+  ~150-250k evals/s sustained (walk-call fill ~0.7) vs the 44-65k
+  launch ceiling before: ~3.5-5x.
+- MEDIUM 600 s: enum ~380-400 s -> 6-10e7 evals -> 40-69k structures =
+  31-52% coverage (was 11-29%) -> P(stage-1 hit) ~ 0.23 x coverage ~
+  7-12% per attempt (was 2.5-7%); 6 attempts/day -> ~36-53%/day (was
+  15-35%).  GA share on H100 drops 2.2x to ~1.6-1.9 s/step at 25-30us
+  (further headroom: N_ACTIVE and the 36-iteration head loop are the
+  floor); stage-2 loop-sweep call ~0.5-0.6 s on H100 (was ~1.2-1.4 s),
+  well inside the 240 s tail reserve.
+- HARD 3600 s: exhaustive R=110 coverage costs 4.6e8 evals x (W-scaling
+  (56/36)^2 x t_min/2) — at t_min=4, W=56: eps ~ 150-250k x (36/56)^2 x
+  (2/4) ~ 31-52k evals/s -> full R=110 sweep = 2.5-4.1 h: NOT exhaustive
+  in one attempt; ladder lands R~30-50, coverage ~25-50%, and the
+  basin at 26-bit/t4 is unmeasured (round-7 showed composition depth
+  shrinks it).  Hard remains gated on the basin, not on throughput.

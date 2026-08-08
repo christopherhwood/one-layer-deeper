@@ -148,7 +148,21 @@ ENUM_KILL_SMALL = 0.60      # when fewer than 32 rows are available
 ENUM_MAX_WALK = 12          # steepest-descent move cap per restart
 ENUM_P_CAP = 6144           # programs per executor call (CPU cache sweet spot)
 ENUM_P_CAP_CUDA = 65536     # H100: launch-bound, so bigger calls win
+ENUM_MAX_K_CUDA = 6         # LUT chunk width for the walk executor on CUDA:
+#                             W=36 -> 6 chunks instead of 9 (fewer sequential
+#                             gathers); LUT bank at P_CAP_CUDA = 4 GiB, fine
+#                             on H100's 80 GB.  CPU keeps k=4 (cache-sized).
+#                             Chunking is bit-exact at any k (LUT composition
+#                             is exact), so this is a pure performance knob.
 ENUM_CHUNK0 = 4
+ENUM_CHUNK0_CUDA = 768      # first-chunk size on CUDA: per-call launch cost
+#                             is ~flat in P, so tiny warm-up chunks would
+#                             poison the measured eval rate the controller
+#                             feeds on (cumulative eps never recovers inside
+#                             a 600 s budget)
+ENUM_CHUNK_MIN_CUDA = 192   # floor for the same reason once warmed up
+ENUM_EPS0_CUDA = 60000.0    # initial eval-rate guess (CUDA) for the ladder
+ENUM_LUT_SLICE = 16384      # table-slice size for wide-chunk LUT composition
 ENUM_CHUNK_MAX = 512        # structures per step (CPU)
 ENUM_CHUNK_MAX_CUDA = 4096
 ENUM_STUCK_STEPS = 160      # stage-2 steps without exactness before resuming
@@ -370,6 +384,14 @@ class LutCache:
 # Discrete vectorized executor (torch longs; exact ISA semantics)
 # ---------------------------------------------------------------------------
 
+EXEC_BATCHED: bool | None = None  # None -> per-device default: CUDA uses the
+#                                   batched (launch-lean) pass kernels, CPU
+#                                   keeps the chunk-loop kernels whose small
+#                                   working set stays cache-resident.  Both
+#                                   are bit-identical (integer ops only);
+#                                   tests override this to cross-validate.
+
+
 def execute_programs(
     fields: Tensor,
     tset: Tensor,
@@ -427,7 +449,22 @@ def execute_programs(
     slot_cols = fields[:, : 7 * K_SLOTS].reshape(p_total, K_SLOTS, 7)
     head_cols = fields[:, 7 * K_SLOTS:]
 
-    # per (slot, segment): subset of programs that may commit there
+    # per-chunk constants for the batched scan-index computation (the whole
+    # (chunk, program, row) index grid is built in a handful of wide kernels
+    # per pass instead of ~14 small ones per chunk -- bit-identical, just
+    # fewer launches)
+    n_chunks = len(chunks)
+    ks_t = torch.tensor(chunks, device=device).view(n_chunks, 1, 1)
+    kmask_t = (1 << ks_t) - 1
+    off_t = torch.tensor(
+        [sum(chunks[:i]) for i in range(n_chunks)], device=device
+    ).view(n_chunks, 1, 1)
+    shift2k = [2 * k for k in chunks]
+
+    # per (slot, segment): subset of programs that may commit there.  All
+    # predicate masks, LUT bases and destination routing are resolved once
+    # here; the per-pass work below is index_select / gather / arithmetic
+    # only.
     plans: list[list[tuple]] = [[] for _ in range(4)]
     for i in range(K_SLOTS):
         lm_c = slot_cols[:, i, 0]
@@ -439,14 +476,26 @@ def execute_programs(
                 continue
             sc = slot_cols[sub, i]
             lidx = tset[sub] * bank.shape[1] + sc[:, 4]
+            pr = sc[:, 6].unsqueeze(1)
+            alw = pr == PRED_ALWAYS
+            masks = (
+                (pr == PRED_HEAD_POS),
+                (pr == PRED_HEAD_NEG),
+                (pr == PRED_TERM_POS) | alw,   # ALWAYS commits at any state
+                (pr == PRED_TERM_NEG) | alw,
+            )
+            dst_acc = (sc[:, 1] == 0).unsqueeze(1)
+            n_acc = int(dst_acc.sum())
+            dst_mode = 4 if n_acc == sub.numel() else (5 if n_acc == 0 else -1)
             plans[seg].append((
                 sub,
-                (sc[:, 1] == 0).unsqueeze(1),  # dst is ACC
+                dst_acc,
                 sc[:, 2] * p_total + sub,      # src_a flat index (tied to dst)
                 sc[:, 3] * p_total + sub,      # src_b flat index
-                (lidx * 2).unsqueeze(1),       # LUT row base
+                (lidx * 2).unsqueeze(1) << (2 * ks_t),  # per-chunk LUT base
                 sc[:, 5].unsqueeze(1),         # init state
-                sc[:, 6].unsqueeze(1),         # predicate
+                masks,                         # static predicate masks
+                dst_mode,                      # uniform dst register (or -1)
                 None,                          # index into the segment union
             ))
 
@@ -458,7 +507,7 @@ def execute_programs(
             continue
         union = torch.unique(torch.cat([entry[0] for entry in plans[seg]]))
         plans[seg] = [
-            entry[:7] + (torch.searchsorted(union, entry[0]),)
+            entry[:8] + (torch.searchsorted(union, entry[0]),)
             for entry in plans[seg]
         ]
         j = 0 if seg == LM_HEAD_A else 1
@@ -466,39 +515,61 @@ def execute_programs(
         is_msb = (head_cols[union, 2 * j + 1] == 0).unsqueeze(1)
         seg_info[seg] = (union, hreg, is_msb)
 
+    batched = EXEC_BATCHED
+    if batched is None:
+        batched = device.type == "cuda"
+
     def run(entry, head_bits: Tensor | None) -> None:
-        sub, dst_acc, a_idx, b_idx, base, ini, pr, union_map = entry
+        sub, dst_acc, a_idx, b_idx, base2, ini, masks, dst_mode, union_map = entry
+        hp, hn, tp, tn = masks
         sp = sub.numel()
         flat = regs.reshape(6 * p_total, rows)
         a = flat.index_select(0, a_idx)
         b = flat.index_select(0, b_idx)
-        state = ini.expand(sp, rows).clone()
-        out = torch.zeros(sp, rows, dtype=torch.long, device=device)
-        shift = 0
-        for k in chunks:
-            m = (1 << k) - 1
-            idx = ((base + state) << (2 * k)) | (
-                (((a >> shift) & m) << k) | ((b >> shift) & m)
-            )
-            val = torch.take(lut_flat[k], idx)
-            out |= (val >> 1) << shift
-            state = val & 1
-            shift += k
-        if head_bits is None:
-            head_bit = torch.zeros(1, 1, dtype=torch.long, device=device)
+        if batched:
+            av = (a.unsqueeze(0) >> off_t) & kmask_t
+            bv = (b.unsqueeze(0) >> off_t) & kmask_t
+            ab = ((av << ks_t) | bv) + base2
+            state: Tensor = ini
+            outs = []
+            for c in range(n_chunks):
+                idx = ab[c] + (state << shift2k[c])
+                val = torch.take(lut_flat[chunks[c]], idx)
+                outs.append(val)
+                state = val & 1
+            out = ((torch.stack(outs) >> 1) << off_t).sum(0)
         else:
-            head_bit = head_bits.index_select(0, union_map)
-        commit = (
-            (pr == PRED_ALWAYS)
-            | ((pr == PRED_HEAD_POS) & (head_bit == 1))
-            | ((pr == PRED_HEAD_NEG) & (head_bit == 0))
-            | ((pr == PRED_TERM_POS) & (state == 1))
-            | ((pr == PRED_TERM_NEG) & (state == 0))
-        )
-        old_acc = regs[4].index_select(0, sub)
-        old_s1 = regs[5].index_select(0, sub)
-        regs[4].index_copy_(0, sub, torch.where(commit & dst_acc, out, old_acc))
-        regs[5].index_copy_(0, sub, torch.where(commit & ~dst_acc, out, old_s1))
+            state = ini.expand(sp, rows).clone()
+            out = torch.zeros(sp, rows, dtype=torch.long, device=device)
+            shift = 0
+            for c, k in enumerate(chunks):
+                m = (1 << k) - 1
+                idx = (base2[c] + (state << shift2k[c])) | (
+                    (((a >> shift) & m) << k) | ((b >> shift) & m)
+                )
+                val = torch.take(lut_flat[k], idx)
+                out |= (val >> 1) << shift
+                state = val & 1
+                shift += k
+        stb = state == 1
+        commit = (tp & stb) | (tn & ~stb)
+        if head_bits is None:
+            commit = commit | hn  # constant zero head bit: HEAD_NEG commits
+        else:
+            hbb = head_bits.index_select(0, union_map) == 1
+            commit = commit | (hp & hbb) | (hn & ~hbb)
+        if dst_mode >= 0:
+            old = regs[dst_mode].index_select(0, sub)
+            regs[dst_mode].index_copy_(0, sub, torch.where(commit, out, old))
+        else:
+            old_acc = regs[4].index_select(0, sub)
+            old_s1 = regs[5].index_select(0, sub)
+            regs[4].index_copy_(
+                0, sub, torch.where(commit & dst_acc, out, old_acc)
+            )
+            regs[5].index_copy_(
+                0, sub, torch.where(commit & ~dst_acc, out, old_s1)
+            )
 
     latched = torch.zeros(p_total, rows, dtype=torch.long, device=device)
     for t_step in range(1, t_max + 1):
@@ -528,6 +599,172 @@ def execute_programs(
         else:
             regs[0] = regs[4]
     return latched
+
+
+# ---------------------------------------------------------------------------
+# Enumeration-walk executor.  Semantics are exactly execute_programs
+# restricted to the walk's program class -- two-active-slot structures
+# (slots 0-1 live on table 0, slots 2-7 NEVER, one table per program, every
+# row at the same depth) -- but the launch schedule is one fused
+# heterogeneous pass per program-local micro-step: at most 2 + 2*width
+# passes per T-step instead of (live slot-entries x width) subset passes,
+# and each pass builds its whole (chunk, program, row) scan-index grid in a
+# handful of wide kernels.  This is the H100 throughput path (the walk is
+# >95% of all training evals); cross-validated bit-exact against
+# execute_programs over the full canonical space at E1 and M5 shapes.
+# ---------------------------------------------------------------------------
+
+ENUM_PAIRS: bool | None = None  # None -> pair executor on CUDA only (CPU
+#                                 keeps the subset executor: measured faster
+#                                 there); tests override to cross-validate
+
+
+def execute_pairs(
+    fields: Tensor,
+    tables: Tensor,
+    xs: Tensor,
+    ns: Tensor,
+    width: int,
+    t_comp: int,
+    mod_between_steps: bool = False,
+    max_k: int | None = None,
+) -> Tensor:
+    """fields: (P, 60) two-active-slot genomes (from _enum_fields); tables:
+    (P, 8) one table per program; all rows execute at depth t_comp."""
+    device = fields.device
+    p_total = fields.shape[0]
+    rows = xs.numel()
+    mask = (1 << width) - 1
+    if max_k is None:
+        max_k = ENUM_MAX_K_CUDA if device.type == "cuda" else 4
+    chunks = chunk_sizes(width, max_k)
+    n_chunks = len(chunks)
+    ks = set(chunks)
+    if max(ks) >= 6 and p_total > ENUM_LUT_SLICE:
+        # cap the LUT composition transients: building 4**6-entry LUTs for
+        # 65,536 tables at once materializes ~17 GB of intermediates; slices
+        # keep the peak near 1 GB with the identical (row-independent) result
+        luts = {
+            k: torch.empty(
+                p_total, 2, 1 << (2 * k), dtype=torch.long, device=device
+            )
+            for k in ks
+        }
+        for lo in range(0, p_total, ENUM_LUT_SLICE):
+            part = build_luts(tables[lo: lo + ENUM_LUT_SLICE], ks)
+            for k in ks:
+                luts[k][lo: lo + ENUM_LUT_SLICE] = part[k]
+    else:
+        luts = build_luts(tables, ks)
+    lut_flat = {k: luts[k].reshape(-1) for k in ks}
+
+    lm0, dst0 = fields[:, 0], fields[:, 1]
+    sb0, ini0, pr0 = fields[:, 3], fields[:, 5], fields[:, 6]
+    lm1, dst1 = fields[:, 7], fields[:, 8]
+    sb1, ini1, pr1 = fields[:, 10], fields[:, 12], fields[:, 13]
+    hsrc_map = torch.tensor(HSRC_REG, device=device)
+    h_reg = torch.stack([hsrc_map[fields[:, 56]], hsrc_map[fields[:, 58]]])
+    h_msb = torch.stack([fields[:, 57] == 0, fields[:, 59] == 0])
+
+    # program-local micro-step schedule.  Reference order: segments run in
+    # loop_mode order (pre, head_A, head_B, post); a head segment runs
+    # `width` iterations; two slots sharing a segment run in slot order
+    # inside each iteration, and the head bit is sampled once per iteration
+    # (before the first slot).  Idle tail micro-steps commit nothing.
+    in_head0 = (lm0 == LM_HEAD_A) | (lm0 == LM_HEAD_B)
+    in_head1 = (lm1 == LM_HEAD_A) | (lm1 == LM_HEAD_B)
+    len0 = torch.where(in_head0, width, 1)
+    len1 = torch.where(in_head1, width, 1)
+    same = (lm0 == lm1).unsqueeze(0)
+    first1 = lm1 < lm0  # slot1 first only from a strictly earlier segment
+    seq_len = torch.where(same[0], 2 * len0, len0 + len1)
+    length = int(seq_len.max())
+    m = torch.arange(length, device=device).unsqueeze(1)  # (L, 1)
+    active = m < seq_len.unsqueeze(0)
+    len_first = torch.where(first1, len1, len0).unsqueeze(0)
+    in_first = m < len_first
+    sel1 = torch.where(same, (m % 2) == 1, in_first == first1.unsqueeze(0))
+    head_it = torch.where(
+        same, m // 2, torch.where(in_first, m, m - len_first)
+    )
+    first_ms = torch.where(same, (m % 2) == 0, torch.ones_like(sel1))
+
+    def pick(a0: Tensor, a1: Tensor) -> Tensor:
+        return torch.where(sel1, a1.unsqueeze(0), a0.unsqueeze(0))
+
+    dst = pick(dst0, dst1)
+    sb = pick(sb0, sb1)
+    ini = pick(ini0, ini1).unsqueeze(-1)          # (L, P, 1)
+    pr = pick(pr0, pr1)
+    seg = pick(lm0, lm1)
+    is_b = seg == LM_HEAD_B
+    hreg = torch.where(is_b, h_reg[1].unsqueeze(0), h_reg[0].unsqueeze(0))
+    hmsb = torch.where(is_b, h_msb[1].unsqueeze(0), h_msb[0].unsqueeze(0))
+    pos = torch.where(hmsb, (width - 1) - head_it, head_it).unsqueeze(-1)
+    ar = torch.arange(p_total, device=device).unsqueeze(0)
+    d_idx = (4 + dst) * p_total + ar
+    b_idx = sb * p_total + ar
+    h_idx = hreg * p_total + ar
+    alw = (pr == PRED_ALWAYS) & active
+    hp = ((pr == PRED_HEAD_POS) & active).unsqueeze(-1)
+    hn = ((pr == PRED_HEAD_NEG) & active).unsqueeze(-1)
+    tp = (((pr == PRED_TERM_POS) & active) | alw).unsqueeze(-1)
+    tn = (((pr == PRED_TERM_NEG) & active) | alw).unsqueeze(-1)
+    first_col = first_ms.unsqueeze(-1)
+
+    ks_t = torch.tensor(chunks, device=device).view(n_chunks, 1, 1)
+    kmask_t = (1 << ks_t) - 1
+    off_t = torch.tensor(
+        [sum(chunks[:i]) for i in range(n_chunks)], device=device
+    ).view(n_chunks, 1, 1)
+    shift2k = [2 * k for k in chunks]
+    # one table per program: LUT row base 2*p, pre-shifted per chunk
+    base2 = (2 * torch.arange(p_total, device=device)).view(
+        1, p_total, 1
+    ) << (2 * ks_t)
+
+    regs = torch.zeros(6, p_total, rows, dtype=torch.long, device=device)
+    regs[0] = (xs & mask).unsqueeze(0)
+    regs[1] = (ns & mask).unsqueeze(0)
+    regs[3] = 1
+    flat = regs.view(6 * p_total, rows)
+
+    for t_step in range(1, t_comp + 1):
+        regs[4].zero_()
+        regs[5].zero_()
+        hb: Tensor | None = None
+        for p in range(length):
+            a = flat.index_select(0, d_idx[p])   # src_a == dst (two-address)
+            b = flat.index_select(0, b_idx[p])
+            hv = flat.index_select(0, h_idx[p])
+            hbf = (hv >> pos[p]) & 1
+            # the head bit is sampled at the iteration's first micro-step
+            # and HELD for a same-segment second slot (reference semantics)
+            hb = hbf if hb is None else torch.where(first_col[p], hbf, hb)
+            av = (a.unsqueeze(0) >> off_t) & kmask_t
+            bv = (b.unsqueeze(0) >> off_t) & kmask_t
+            ab = ((av << ks_t) | bv) + base2
+            state: Tensor = ini[p]
+            outs = []
+            for c in range(n_chunks):
+                idx = ab[c] + (state << shift2k[c])
+                val = torch.take(lut_flat[chunks[c]], idx)
+                outs.append(val)
+                state = val & 1
+            out = ((torch.stack(outs) >> 1) << off_t).sum(0)
+            stb = state == 1
+            hbb = hb == 1
+            commit = (
+                (tp[p] & stb) | (tn[p] & ~stb)
+                | (hp[p] & hbb) | (hn[p] & ~hbb)
+            )
+            flat.index_copy_(0, d_idx[p], torch.where(commit, out, a))
+        if t_step < t_comp:
+            if mod_between_steps:
+                regs[0] = regs[4].remainder(regs[1])
+            else:
+                regs[0] = regs[4]
+    return regs[4].clone()
 
 
 # ---------------------------------------------------------------------------
@@ -661,8 +898,15 @@ class Model(nn.Module):
         self.config = Config(spec.vocab_size, spec.max_seq_len)
         self.decimal_width = max(2, (spec.max_seq_len - 4) // 2)
         value_bits = (3322 * self.decimal_width + 999) // 1000 + 1
-        # wide tape: room for an unreduced product of two reduced values
-        self.width_max = 2 * value_bits + 4
+        # wide tape: room for an unreduced product of two reduced values.
+        # Clamped to 62: at decimal_width >= 9 (possible when a dataset's
+        # OOD-N depth moduli reach 9+ digits, which pushes max_seq_len to
+        # 22+) the unclamped tape would be 66+ bits -- beyond int64, where
+        # (1 << width) - 1 wraps or raises and >>-shifts past 63 are
+        # undefined.  62 keeps every mask/shift in-range; batches whose
+        # moduli exceed 29 bits degrade to tape truncation instead of
+        # undefined behavior.  No effect at any width <= 60 shape.
+        self.width_max = min(2 * value_bits + 4, 62)
         gen = torch.Generator().manual_seed(GA_SEED)
 
         def logits(*shape: int) -> nn.Parameter:
@@ -1142,9 +1386,12 @@ class Model(nn.Module):
                 if analytic:
                     # sample on CPU: self._exec_rng is a CPU generator and
                     # torch.multinomial rejects a generator/probs device split
+                    # .float(): under the hosted bf16 autocast the softmax
+                    # comes out bf16; CPU multinomial support for bf16 is
+                    # torch-version-dependent, float32 is not
                     probs = F.softmax(
                         self.table_ent[chain, t_free].detach(), dim=-1
-                    ).cpu()
+                    ).float().cpu()
                     samples = torch.multinomial(
                         probs, SWEEP_POSTERIOR_SAMPLES, replacement=True,
                         generator=self._exec_rng,
@@ -1293,7 +1540,7 @@ class Model(nn.Module):
             if free_tables:
                 probs = F.softmax(
                     self.table_ent[chain, t_free].detach(), dim=-1
-                ).cpu()
+                ).float().cpu()
                 samples = torch.multinomial(
                     probs, LOOP_POSTERIOR_SAMPLES, replacement=True,
                     generator=self._exec_rng,
@@ -1427,22 +1674,38 @@ class Model(nn.Module):
         width: int, t_comp: int = 1,
     ) -> Tensor:
         """Discrete execution of (program, its-own-table) rows at depth
-        t_comp (mod-N-interleaved self-composition when t_comp > 1)."""
+        t_comp (mod-N-interleaved self-composition when t_comp > 1).
+
+        On CUDA this routes through the launch-lean pair executor
+        (bit-identical to execute_programs on this program class -- and a
+        verified hit is ALSO re-checked through the generic executor before
+        it reaches the buffers, see _enum_chunk); the CPU path keeps the
+        subset executor whose small working set stays cache-resident."""
         p_total = fields.shape[0]
-        cap = ENUM_P_CAP if fields.device.type == "cpu" else ENUM_P_CAP_CUDA
+        on_cpu = fields.device.type == "cpu"
+        cap = ENUM_P_CAP if on_cpu else ENUM_P_CAP_CUDA
+        pairs = not on_cpu if ENUM_PAIRS is None else ENUM_PAIRS
         outs = []
         for lo in range(0, p_total, cap):
             f = fields[lo: lo + cap]
             t = tables[lo: lo + cap]
-            outs.append(
-                execute_programs(
-                    f,
-                    torch.arange(f.shape[0], device=f.device),
-                    t.unsqueeze(1),
-                    xs, ns, torch.full_like(xs, t_comp), width, t_comp,
-                    mod_between_steps=t_comp > 1,
+            if pairs:
+                outs.append(
+                    execute_pairs(
+                        f, t, xs, ns, width, t_comp,
+                        mod_between_steps=t_comp > 1,
+                    )
                 )
-            )
+            else:
+                outs.append(
+                    execute_programs(
+                        f,
+                        torch.arange(f.shape[0], device=f.device),
+                        t.unsqueeze(1),
+                        xs, ns, torch.full_like(xs, t_comp), width, t_comp,
+                        mod_between_steps=t_comp > 1,
+                    )
+                )
         self._enum_eval_acc += p_total
         return outs[0] if len(outs) == 1 else torch.cat(outs)
 
@@ -2252,12 +2515,19 @@ class Schedule:
                     and m_left > 0
                     and elite_pool
                 ):
+                    on_cpu = m.slot_lm.device.type == "cpu"
                     done = float(m.enum_done)
                     if done > 0:
                         eps = float(m.enum_evals) / max(float(m.enum_secs), 1e-3)
                         sfrac = min(max(float(m.enum_surv) / done, 0.05), 1.0)
                     else:
-                        eps, sfrac = 10000.0, 0.65
+                        # CUDA initial guess is calibrated high: per-call cost
+                        # is launch-dominated (~flat in P), so lowballing it
+                        # would lock the controller into tiny, launch-wasting
+                        # chunks that the cumulative eps measurement can
+                        # never climb out of within a Medium budget
+                        eps = 10000.0 if on_cpu else ENUM_EPS0_CUDA
+                        sfrac = 0.65
                     enum_budget = max(remaining - ENUM_TAIL_RESERVE, 1.0)
                     for enum_r in ENUM_RESTART_LADDER:
                         cost = ENUM_EVA + sfrac * max(
@@ -2271,17 +2541,15 @@ class Schedule:
                         ENUM_EVA
                         + sfrac * max(enum_r - ENUM_RESTARTS_A, 0) * ENUM_EVR
                     ) / max(eps, 100.0)
-                    chunk_cap = (
-                        ENUM_CHUNK_MAX
-                        if m.slot_lm.device.type == "cpu"
-                        else ENUM_CHUNK_MAX_CUDA
-                    )
+                    chunk_cap = ENUM_CHUNK_MAX if on_cpu else ENUM_CHUNK_MAX_CUDA
+                    chunk_floor = 1 if on_cpu else ENUM_CHUNK_MIN_CUDA
                     enum_n = max(
-                        1,
+                        chunk_floor,
                         min(chunk_cap, int(enum_sec / max(spst, 1e-4))),
                     )
                     if done == 0:
-                        enum_n = ENUM_CHUNK0
+                        enum_n = ENUM_CHUNK0 if on_cpu else ENUM_CHUNK0_CUDA
+                    enum_n = min(enum_n, m_left)
 
             m._plan = {
                 "active": active,
