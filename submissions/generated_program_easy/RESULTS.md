@@ -40,6 +40,17 @@ experiment is hierarchical endpoint fitness: retain local bit credit while
 adding leading-decimal-prefix and circular modular-distance credit to prefer
 globally coherent arithmetic programs.
 
+## General semantic-closure follow-up
+
+The follow-up replaces the Horner-shaped language with a general expression
+grammar over `{x, N, 0, 1}` and seven ordinary integer operations. One unchanged
+benchmark bridge reaches 100% test/OOD on square, hidden cube, and hidden affine
+recurrences; it also certifies variable-modulus squaring through T=64 for seen
+and unseen moduli. Bottom-up closure generates all nine audited recurrence and
+reduction families within four operations and endpoint gradients select each
+with 100% wider-modulus accuracy. See `GENERALITY_RESULTS.md` for the full
+expressivity matrix, Hard-shape stress, and research-comparison caveats.
+
 ## Interpretation and limitation
 
 The winning complete program is no longer required to be present in the
