@@ -31,10 +31,15 @@ class CountingProgram(nn.Module):
         self.weight = nn.Parameter(torch.randn(1, 1, MODULE.NUM_DIGITS))
         self.calls = 0
 
-    def forward(self, register, modulus, original, temperature, hardness):
-        del modulus, original, temperature, hardness
+    def forward(self, register, modulus, temperature, hardness):
+        del modulus, temperature, hardness
         self.calls += 1
-        logits = self.weight.expand(register.shape[0], self.width, -1)
+        if self.calls == 1:
+            logits = self.weight.expand(register.shape[0], self.width, -1)
+        else:
+            # Only the first transition reads the parameter. The terminal
+            # loss can reach it only through every intervening outer state.
+            logits = register.clamp_min(1e-6).log()
         candidate = logits.softmax(dim=-1)
         phases = tuple(logits for _ in range(MODULE.COMPUTE_SWEEPS))
         controller = torch.full(
@@ -52,6 +57,20 @@ class CountingProgram(nn.Module):
 
 
 class CanonicalCategoricalTransitionTest(unittest.TestCase):
+    def test_even_prompt_length_preserves_every_decimal_digit(self) -> None:
+        model = MODULE.build_model(ModelSpec(17, 10, 500_000_000))
+        self.assertEqual(model.width, 3)
+        inputs = torch.tensor(
+            [[MODULE.N_MARK, 10, 9, 10, MODULE.X_MARK, 9, 7, 10,
+              MODULE.T_MARK, 8]]
+        )
+        modulus, value, time_steps = model._parse(
+            inputs, torch.ones_like(inputs).bool()
+        )
+        self.assertEqual(modulus.argmax(dim=-1).tolist(), [[3, 2, 3]])
+        self.assertEqual(value.argmax(dim=-1).tolist(), [[3, 0, 2]])
+        self.assertEqual(time_steps.tolist(), [1])
+
     def test_training_reaches_endpoint_beyond_eight_recurrences(self) -> None:
         torch.manual_seed(0)
         model = MODULE.build_model(ModelSpec(17, 12, 500_000_000))

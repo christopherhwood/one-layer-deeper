@@ -2,90 +2,101 @@
 
 ## Rule-safety boundary
 
-This candidate is the rule-safe successor to the constructive categorical
+This is the rule-safe neural successor to the constructive categorical
 endpoint proof. Its `forward` contains no multiplication, modular reduction,
 comparison, carry/borrow, digit-product table, squaring branch, or
-recurrence-specific transition. It parses `N`, `x`, and `T`, then applies one
-randomly initialized, translation-equivariant learned cell repeatedly. The
-only persistent mutable state is a distribution over decimal digits plus a
-16-way categorical controller.
+recurrence-specific transition. It parses `N`, `x`, and `T`, then repeatedly
+applies one randomly initialized, translation-equivariant learned cell.
 
-This distinction matters for the private-task warning that Hard may change the
-recurrence. Earlier arithmetic interpreters could execute repeated squaring
-perfectly, but they hard-coded the known algorithm and are not admissible Hard
-candidates. This model can represent other local recurrent programs, but must
-discover them from endpoint supervision.
+The mutable state carried between recurrence applications is only a decimal
+digit distribution. A 16-way categorical controller exists inside one
+application but is reset before the next. The transition sees the current
+state and N, never the original x, so it is forced to have the Markov form
 
-## Local evidence
+`state_(t+1) = learned_transition(state_t, N)`.
 
-Two complete width sweeps gave the best balance between computation per
-example and optimizer updates per minute.
+This is compatible with the private warning that Hard may change the
+recurrence. Earlier arithmetic interpreters executed repeated squaring
+perfectly but hard-coded the known algorithm and are not admissible Hard
+candidates.
 
-| variable-modulus E5 CPU, 60 s | updates | ID exact | OOD-N exact | mean |
-|---|---:|---:|---:|---:|
-| 1 sweep | 2,312 | 0.50% | 0.00% | 0.25% |
-| **2 sweeps** | **1,281** | **1.00%** | **0.67%** | **0.83%** |
-| 4 sweeps | 768 | 0.42% | 1.00% | 0.71% |
+## Three repaired proof assumptions
 
-The two-sweep version also passed the fixed-modulus ten-second smoke with
-13.67% mean exact accuracy after 1,000 updates.
+The first hosted Hard artifact did not actually implement the mathematical
+architecture we intended. Three independent defects were found and repaired:
 
-To test recurrence flexibility rather than squaring-specific fit, the same
-four-sweep cell was trained on a generated hidden recurrence
-`state <- 3*state + 1 (mod N)` without changing the model source. It reached
-5.33% held-out exact after ten seconds and 4.00% after sixty seconds, but 0%
-on unseen depth T=6. Thus the architecture can learn signal from a changed
-rule, while compositional depth generalization remains unsolved.
+1. Training stopped the outer rollout after eight steps. Rows with larger T
+   never selected a terminal state, leaving their supervised logits equal to a
+   constant zero tensor.
+2. Every outer state after the first was detached. Endpoint gradients
+   therefore could not constrain the shared transition through its
+   composition, contrary to the positive proof's premise. Full recurrent
+   backpropagation is now retained.
+3. Even-length prompts used `(max_seq_len - 5) // 2` decimal cells. A prompt
+   of length ten containing three-digit N and x therefore received only two
+   cells, irreversibly dropping the hundreds digit. The correct geometry is
+   `(max_seq_len - 4) // 2`.
 
-## Hosted H100 evidence
+The transition also used to receive immutable original x at every outer step,
+which enabled direct endpoint memorization. That shortcut has been removed.
 
-| tier/data | sweeps | updates | ID exact | OOD exact | score | submission |
-|---|---:|---:|---:|---:|---:|---|
-| Easy E5 | 4 | 573 / 60 s | 0.30% | 0.30% | 0.30% | `53a90f83` |
-| **Easy E5** | **2** | **1,259 / 60 s** | **0.80%** | **1.00%** | **0.92%** | `5c100c75` |
-| Hard H1 | 2 | 23,043 / 3,600 s | 0.10% | 0.00% OOD-T, 0.10% OOD-N-T | 0.05% | `6f255767` |
+Regression tests now prove that a T=16 endpoint executes all 16 transitions
+and has a nonzero gradient to the transition parameters, and that a
+length-ten prompt preserves all three decimal digits of N=323 and x=203.
 
-The two-sweep Easy run is the strongest rule-safe learned-recurrence result in
-this repository so far. Training exact accuracy rose to 3.9%, and its hosted
-ID/OOD result closely reproduced the local gate.
+## Constructive learning evidence after repair
 
-## What the first Hard run actually found
+All results below use the same model source and endpoint labels only. The
+affine and cube probes change the recurrence without changing the model.
 
-The Hard trace stayed at 0% training exact for the entire hour and its loss
-remained near the uniform-token baseline. Inspection found a real connectivity
-bug: training executed at most eight outer recurrence steps. For a labelled
-row with T greater than eight, no iteration ever selected that row's terminal
-state, so its supervised logits remained a constant zero tensor. Easy E5 uses
-only T=1/2/3 and could not expose the bug.
+| CPU probe, 60 s unless noted | held-out ID exact | unseen-depth exact |
+|---|---:|---:|
+| affine, train T=1 only | **66.0% at T=1** | **50.0% at T=2** |
+| affine, train T=1/2/3 | **52.67%** | **17.0% at T=6** |
+| cube, train T=1/2/3 | **26.67%** | **32.0% at T=6** |
+| fixed-N squaring, public E1 geometry | **29.33%** | **33.0% at T=6** |
+| variable-N squaring, public E5 geometry | 0.75% | 1.33% at T=6 |
 
-The cap is now removed. Training rolls each batch through its actual maximum
-T, up to the evaluator-supported 64. A regression test replaces the learned
-cell with a counting differentiable transition and verifies that a T=16 row:
+The affine T=1-only training batches reached 100% exact. With only 200 of the
+available x values in training, the learned transition still reached 66% on
+withheld x and 50% when composed twice. This is direct executable evidence for
+the positive theorem's mechanism: endpoint supervision can identify a reusable
+transition, and the same weights can generalize to an unseen recurrence depth.
 
-1. executes exactly 16 outer transitions;
-2. produces endpoint logits connected to a trainable parameter; and
-3. propagates a nonzero endpoint gradient.
+The fixed-N ten-second smoke also improved from 13.67% before the repairs to
+21.83%. On the full public E1 geometry, one CPU minute reached 31.17% mean
+exact across ordinary and OOD-T evaluation.
 
-Consequently, the 0.05% Hard result is evidence against the capped artifact,
-not a clean falsification of the generic categorical architecture or the
-positive identifiability theorem. The uncapped artifact still needs a new Hard
-run after the daily quota resets. Its expected cost is substantially lower
-throughput on batches whose maximum T is large, but unlike the first run it
-will receive the intended endpoint learning signal.
+## Remaining frontier
 
-## Remaining gap
+Variable modulus is now the isolated failure. On a variable-N T=1-only
+squaring probe, training batch exact reached 69.5%, but held-out T=1 was only
+0.25% and unseen T=2 was 1.33%. The neural cell can memorize the available
+endpoint pairs but does not infer the shared modular-multiplication program.
 
-Removing the cap repairs supervision; it does not prove that optimization will
-discover a reusable transition. The altered-rule probe still failed at unseen
-depth, and no run has certified T=1. The next decisive evidence is therefore:
+That distinguishes two regimes:
 
-- uncapped Hard training must move below the uniform-loss plateau and produce
-  nonzero training exact accuracy;
-- T=1 must improve before deeper recurrence can be credited to composition;
-- accuracy must then decay slowly, rather than collapse immediately, with T;
-- OOD-N must track ID closely enough to indicate a shared learned program.
+- compact changed recurrences such as affine and fixed-N cube/squaring are
+  learnable and compositionally reusable;
+- discovering a length- and modulus-general arithmetic program still requires
+  a much smaller, program-like hypothesis class or substantially stronger
+  teaching coverage.
 
-If the repaired run learns T=1 but not larger T, the next architectural change
-should target stable recurrent composition. If it still cannot learn T=1, the
-remaining problem is one-step program identification from sparse endpoints,
-not recurrence depth.
+## Hosted H100 history
+
+| artifact | tier/data | updates | score | submission |
+|---|---|---:|---:|---|
+| four-sweep pre-repair | Easy E5 | 573 / 60 s | 0.30% | `53a90f83` |
+| two-sweep pre-repair | Easy E5 | 1,259 / 60 s | 0.92% | `5c100c75` |
+| capped/detached pre-repair | Hard H1 | 23,043 / 3,600 s | 0.05% | `6f255767` |
+
+The Hard trace stayed at 0% training exact for the entire hour and remained
+near uniform-token loss. Because that artifact disconnected deeper endpoints,
+its 0.05% score is not evidence against the repaired architecture or the
+positive identifiability theorem.
+
+The corrected artifact has passed source validation, the fixed-N smoke, the
+changed-affine and changed-cube probes, the deep T=16 connectivity gate, and
+the variable-N E5 CPU gate. A shared-account Hard run from the separate
+learned-ISA line currently occupies the daily hosted slot; this corrected
+artifact still requires its own Easy and Hard H100 measurements.

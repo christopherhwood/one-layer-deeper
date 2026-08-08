@@ -84,7 +84,7 @@ class CategoricalCell(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         local_width = 3 * (NUM_DIGITS + CONTROL_STATES)
-        context_width = 3 * NUM_DIGITS + HIDDEN + 2 + 4
+        context_width = 2 * NUM_DIGITS + HIDDEN + 2 + 4
         self.input = nn.Linear(local_width + context_width, 2 * HIDDEN)
         self.norm = RMSNorm(2 * HIDDEN)
         self.body = nn.Sequential(
@@ -110,7 +110,6 @@ class CategoricalCell(nn.Module):
         controller: Tensor,
         source: Tensor,
         modulus: Tensor,
-        original: Tensor,
         clock: Tensor,
         boundary: Tensor,
         phase: Tensor,
@@ -130,7 +129,6 @@ class CategoricalCell(nn.Module):
                 right_control,
                 source,
                 modulus,
-                original,
                 clock[:, None].expand(-1, width, -1),
                 boundary.expand(batch, -1, -1),
                 phase[:, None].expand(-1, width, -1),
@@ -174,7 +172,6 @@ class CanonicalProgram(nn.Module):
         self,
         register: Tensor,
         modulus: Tensor,
-        original: Tensor,
         temperature: float,
         hardness: float,
     ) -> tuple[
@@ -229,7 +226,6 @@ class CanonicalProgram(nn.Module):
                 controller,
                 register,
                 modulus,
-                original,
                 self.clock_embedding[sweep][None].expand(batch, -1),
                 boundary,
                 phase,
@@ -257,7 +253,11 @@ class Model(nn.Module):
         super().__init__()
         self.config = Config(spec.vocab_size, spec.max_seq_len)
         self.max_length = spec.max_seq_len
-        self.width = max(2, (spec.max_seq_len - 5) // 2)
+        # A prompt contains N and x plus three markers and one or two T
+        # digits.  Subtracting five under-allocates even-length prompts (for
+        # example max_seq_len=10 with three-digit N and x), irreversibly
+        # truncating the most-significant decimal digit.
+        self.width = max(2, (spec.max_seq_len - 4) // 2)
         self.program = CanonicalProgram(self.width)
         self.training_temperature = 1.25
         self.eval_temperature = 0.20
@@ -370,7 +370,6 @@ class Model(nn.Module):
             attention_mask = input_ids != PAD
         valid = attention_mask.bool()
         modulus, register, t_values = self._parse(input_ids, valid)
-        original = register
         # Every labelled endpoint must actually be reached.  Capping this
         # rollout silently disconnects rows with larger T from the supervised
         # loss: their terminal logits remain the constant zero tensor.
@@ -385,11 +384,6 @@ class Model(nn.Module):
         first_controller: Tensor | None = None
         first_digit_soft: Tensor | None = None
         for outer_step in range(loops):
-            transition_input = (
-                register.detach()
-                if self.training and outer_step > 0
-                else register
-            )
             (
                 candidate,
                 candidate_logits,
@@ -397,9 +391,8 @@ class Model(nn.Module):
                 controller_soft,
                 digit_soft,
             ) = self.program(
-                transition_input,
+                register,
                 modulus,
-                original,
                 temperature,
                 hardness,
             )
