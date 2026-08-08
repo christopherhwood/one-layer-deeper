@@ -39,6 +39,9 @@ SWEEPS = 2
 MAX_OUTER_STEPS = 64
 BASE_LR = 1.0e-3
 PHASE_WEIGHT = 0.5
+BIT_WEIGHT = 1.0
+ORDINAL_BINS = 32
+ORDINAL_WEIGHT = 0.5
 
 
 class Config:
@@ -86,6 +89,7 @@ class CellularTransition(nn.Module):
     def __init__(self, digits: int) -> None:
         super().__init__()
         self.digits = digits
+        self.bit_width = (3322 * digits + 999) // 1000 + 1
         self.source_projection = nn.Linear(NUM_DIGITS, HIDDEN, bias=False)
         self.modulus_projection = nn.Linear(NUM_DIGITS, HIDDEN, bias=False)
         self.boundary_projection = nn.Linear(2, HIDDEN, bias=False)
@@ -95,6 +99,8 @@ class CellularTransition(nn.Module):
         self.cell = CellularUpdate()
         self.output_norm = RMSNorm(HIDDEN)
         self.output = nn.Linear(HIDDEN, NUM_DIGITS)
+        self.bit_output = nn.Linear(HIDDEN, 2 * self.bit_width)
+        self.ordinal_output = nn.Linear(HIDDEN, ORDINAL_BINS)
         self.feedback = nn.Linear(NUM_DIGITS, HIDDEN, bias=False)
         self.feedback_gate = nn.Parameter(torch.full((HIDDEN,), -1.5))
         nn.init.normal_(self.seed, std=HIDDEN**-0.5)
@@ -112,7 +118,9 @@ class CellularTransition(nn.Module):
         source: Tensor,
         modulus: Tensor,
         temperature: float,
-    ) -> tuple[Tensor, tuple[Tensor, ...]]:
+    ) -> tuple[
+        Tensor, tuple[Tensor, ...], tuple[Tensor, ...], tuple[Tensor, ...]
+    ]:
         source_features = self.source_projection(source)
         modulus_features = self.modulus_projection(modulus)
         boundary_features = self._boundaries(source)
@@ -130,16 +138,30 @@ class CellularTransition(nn.Module):
         )
         state = context + self.seed
         phase_logits: list[Tensor] = []
+        phase_bit_logits: list[Tensor] = []
+        phase_ordinal_logits: list[Tensor] = []
         for _ in range(SWEEPS):
             for _ in range(self.digits):
                 state = self.cell(state, context)
             logits = self.output(self.output_norm(state))
             phase_logits.append(logits)
+            pooled = self.output_norm(state).mean(dim=1)
+            phase_bit_logits.append(
+                self.bit_output(pooled).reshape(
+                    source.shape[0], self.bit_width, 2
+                )
+            )
+            phase_ordinal_logits.append(self.ordinal_output(pooled))
             probabilities = F.softmax(logits / temperature, dim=-1)
             state = state + torch.sigmoid(self.feedback_gate) * self.feedback(
                 probabilities
             )
-        return probabilities, tuple(phase_logits)
+        return (
+            probabilities,
+            tuple(phase_logits),
+            tuple(phase_bit_logits),
+            tuple(phase_ordinal_logits),
+        )
 
 
 class Model(nn.Module):
@@ -153,6 +175,7 @@ class Model(nn.Module):
         # capacity split between N and x.  Using ``-5`` drops a leading digit
         # for even prompt lengths (for example max_seq_len=10).
         self.digits = max(2, (spec.max_seq_len - 4) // 2)
+        self.bit_width = (3322 * self.digits + 999) // 1000 + 1
         self.transition = CellularTransition(self.digits)
         self.training_temperature = 1.0
         self.eval_temperature = 0.10
@@ -270,12 +293,60 @@ class Model(nn.Module):
             )
             for _ in range(SWEEPS)
         ]
+        terminal_bit_phases = [
+            torch.zeros(
+                batch,
+                self.bit_width,
+                2,
+                device=input_ids.device,
+                dtype=register.dtype,
+            )
+            for _ in range(SWEEPS)
+        ]
+        terminal_ordinal_phases = [
+            torch.zeros(
+                batch,
+                ORDINAL_BINS,
+                device=input_ids.device,
+                dtype=register.dtype,
+            )
+            for _ in range(SWEEPS)
+        ]
         for outer_step in range(outer_steps):
-            candidate, phases = self.transition(register, modulus, temperature)
+            transition_output = self.transition(register, modulus, temperature)
+            if len(transition_output) == 4:
+                candidate, phases, bit_phases, ordinal_phases = transition_output
+            elif len(transition_output) == 3:
+                candidate, phases, bit_phases = transition_output
+                ordinal_phases = tuple(
+                    register.new_zeros(batch, ORDINAL_BINS)
+                    for _ in range(SWEEPS)
+                )
+            else:
+                candidate, phases = transition_output
+                bit_phases = tuple(
+                    register.new_zeros(batch, self.bit_width, 2)
+                    for _ in range(SWEEPS)
+                )
+                ordinal_phases = tuple(
+                    register.new_zeros(batch, ORDINAL_BINS)
+                    for _ in range(SWEEPS)
+                )
             terminal = (t_values == outer_step + 1)[:, None, None]
             terminal_phases = [
                 torch.where(terminal, phase, previous)
                 for phase, previous in zip(phases, terminal_phases)
+            ]
+            terminal_bit_phases = [
+                torch.where(terminal, phase, previous)
+                for phase, previous in zip(bit_phases, terminal_bit_phases)
+            ]
+            ordinal_terminal = (t_values == outer_step + 1)[:, None]
+            terminal_ordinal_phases = [
+                torch.where(ordinal_terminal, phase, previous)
+                for phase, previous in zip(
+                    ordinal_phases, terminal_ordinal_phases
+                )
             ]
             active = (t_values > outer_step)[:, None, None]
             register = torch.where(active, candidate, register)
@@ -288,7 +359,19 @@ class Model(nn.Module):
             self._place_logits(phase, lengths, prompt)
             for phase in terminal_phases
         )
-        return logits, {"phase_logits": phase_logits}
+        decimal_powers = 10 ** torch.arange(
+            self.digits, device=modulus.device
+        )
+        modulus_integer = (
+            modulus.argmax(dim=-1).long() * decimal_powers[None]
+        ).sum(dim=1)
+        return logits, {
+            "phase_logits": phase_logits,
+            "bit_logits": tuple(terminal_bit_phases),
+            "bit_width": self.bit_width,
+            "ordinal_logits": tuple(terminal_ordinal_phases),
+            "modulus_integer": modulus_integer,
+        }
 
 
 def _target_aligned(full_logits: Tensor, batch: TokenLossBatch) -> Tensor:
@@ -317,7 +400,39 @@ def token_training_loss(batch: TokenLossBatch) -> Tensor:
         _masked_cross_entropy(_target_aligned(phase, batch), batch)
         for phase in batch.auxiliary["phase_logits"]
     ]
-    return endpoint + PHASE_WEIGHT * torch.stack(phases).mean()
+    labels = batch.labels
+    target = torch.zeros(
+        labels.shape[0], device=labels.device, dtype=torch.long
+    )
+    for position in range(labels.shape[1]):
+        valid = batch.valid_mask[:, position]
+        digit = (labels[:, position] - DIGIT_OFFSET).clamp(0, 9)
+        target = torch.where(valid, target * 10 + digit, target)
+    width = int(batch.auxiliary["bit_width"])
+    positions = torch.arange(width, device=target.device)
+    target_bits = ((target[:, None] >> positions[None]) & 1).long()
+    bit_losses = [
+        F.cross_entropy(logits.transpose(1, 2), target_bits)
+        for logits in batch.auxiliary["bit_logits"]
+    ]
+    modulus = batch.auxiliary["modulus_integer"].clamp_min(1)
+    thresholds = torch.arange(
+        1, ORDINAL_BINS + 1, device=target.device
+    )[None]
+    ordinal_target = (
+        target[:, None] * (ORDINAL_BINS + 1)
+        >= modulus[:, None] * thresholds
+    ).to(torch.float32)
+    ordinal_losses = [
+        F.binary_cross_entropy_with_logits(logits.float(), ordinal_target)
+        for logits in batch.auxiliary["ordinal_logits"]
+    ]
+    return (
+        endpoint
+        + PHASE_WEIGHT * torch.stack(phases).mean()
+        + BIT_WEIGHT * torch.stack(bit_losses).mean()
+        + ORDINAL_WEIGHT * torch.stack(ordinal_losses).mean()
+    )
 
 
 class WallClockSchedule:

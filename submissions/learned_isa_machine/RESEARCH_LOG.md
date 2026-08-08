@@ -697,3 +697,12 @@ H100 projection (20-30 us/launch + ~2 TB/s memory model, W=36/t2):
   in one attempt; ladder lands R~30-50, coverage ~25-50%, and the
   basin at 26-bit/t4 is unmeasured (round-7 showed composition depth
   shrinks it).  Hard remains gated on the basin, not on throughput.
+
+### Hosted Easy result for the round-8 build
+
+The hash-gated source (`188e201b...`) ran on Easy E1 as submission
+`763d8175-b28b-46f6-8f8d-fdb664e4bf05`. It completed 177 updates and scored
+8.00% mean exact (6.0% test, 10.0% OOD), with no certified rung. Training
+exact remained 0.4% at the end. This rejects the current generic search
+machine as a competitive 5 PM candidate even before resolving its Rule 7/8/9
+and task-specific-enumeration concerns.

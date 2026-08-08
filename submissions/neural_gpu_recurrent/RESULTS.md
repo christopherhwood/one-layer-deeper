@@ -53,3 +53,59 @@ restores magnitude but makes training diverge; a real residual digit-logit state
 fits the fixed smoke yet does not improve variable-modulus or Medium-depth
 learning.  The retained model is therefore a strong rule-clean Easy baseline,
 not a credible Hard submission.
+
+## Dense endpoint-bit supervision (2026-08-08)
+
+The retained rule-clean model now adds a learned binary endpoint head to the
+recurrent hidden state. The only target remains the evaluator's final answer;
+the loss merely represents that same endpoint in binary as well as decimal.
+No carry, product, quotient, reduction, or other intermediate arithmetic state
+is supplied, and the forward transition remains the same generic tied cell.
+
+This is a genuine fixed-modulus improvement:
+
+| gate | setting | score | test | OOD | updates |
+|---|---|---:|---:|---:|---:|
+| CPU fixed 10 s | bit weight 0.5 | 49.17% | 43.33% | 55.00% | 446 |
+| CPU fixed 10 s | bit weight 1.0 | **50.17%** | 43.33% | 57.00% | 416 |
+| CPU fixed 10 s | bit weight 2.0 | 46.50% | 40.00% | 53.00% | 436 |
+| H100 Easy E1 | bit weight 0.5 | **71.67%** | 57.33% | 86.00% | 963 |
+
+The H100 run is submission `3351ddfc-9ae2-4d73-b010-ff9b932f935d`.
+It narrowly exceeds the previous rule-clean 71.33% record, while improving
+the OOD split from 82% to 86%.
+
+The variable-modulus result remains negative. With bit weight 0.5, the full
+60-second E5-shaped CPU gate scored 0.29% exact and 15.10% token accuracy;
+no seen- or unseen-modulus rung certified. Dense endpoint representation helps
+optimization once the modulus is fixed, but it still does not identify a
+modulus-general arithmetic program.
+
+## Ordinal endpoint supervision
+
+The final retained source also asks the recurrent hidden state to predict 32
+thresholds for the endpoint's normalized position `answer / N`. This is the
+same final answer expressed as a smooth ordinal target; it does not reveal the
+quotient used by modular reduction or any intermediate state.
+
+With bit weight 1.0 and ordinal weight 0.5:
+
+| gate | score | test | OOD | additional evidence |
+|---|---:|---:|---:|---|
+| CPU fixed 10 s | 52.00% | 45.00% | 59.00% | first-token signal 69.83% |
+| H100 Easy E1 | **73.50%** | 60.00% | 87.00% | 1,157 updates; no rung |
+| CPU variable E5 60 s | 0.79% | 0.75% | 0.83% | 16.36% token; no rung |
+| CPU hidden affine 10 s | 43.00% | 56.00% | 30.00% | unchanged source |
+| CPU hidden cube 10 s | 31.83% | 26.67% | 37.00% | unchanged source |
+
+The record H100 run is submission
+`39a425de-9304-4eac-b7a5-ab80f6aecf18`. The same source learns materially on
+changed recurrences, which is evidence that the architecture is genuinely
+general rather than a disguised squaring interpreter.
+
+A variable-modulus T=1-only isolation completed 3,978 CPU updates, reached
+100% training-batch exact, but scored only 1.75% held out (1.0% test, 2.5%
+OOD). This rules out recurrent depth as the main variable-N blocker: even one
+application is underidentified outside the training pairs. More depth
+curriculum cannot turn this architecture into a competitive Medium/Hard model
+without a new modulus-general program representation.

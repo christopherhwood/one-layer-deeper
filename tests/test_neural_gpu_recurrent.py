@@ -72,6 +72,27 @@ class NeuralGpuRecurrentTest(unittest.TestCase):
         self.assertIsNotNone(transition.weight.grad)
         self.assertGreater(float(transition.weight.grad.abs().sum()), 0.0)
 
+    def test_endpoint_heads_preserve_only_endpoint_information(self) -> None:
+        torch.manual_seed(0)
+        model = MODULE.build_model(ModelSpec(17, 10, 500_000_000))
+        model.train()
+        inputs = torch.tensor(
+            [[MODULE.N_MARK, 10, 9, 10, MODULE.X_MARK, 9, 7, 10,
+              MODULE.T_MARK, 8]]
+        )
+        _, auxiliary = model(inputs, torch.ones_like(inputs).bool())
+        self.assertEqual(auxiliary["modulus_integer"].tolist(), [323])
+        self.assertEqual(len(auxiliary["bit_logits"]), MODULE.SWEEPS)
+        self.assertEqual(
+            tuple(auxiliary["bit_logits"][0].shape),
+            (1, model.bit_width, 2),
+        )
+        self.assertEqual(len(auxiliary["ordinal_logits"]), MODULE.SWEEPS)
+        self.assertEqual(
+            tuple(auxiliary["ordinal_logits"][0].shape),
+            (1, MODULE.ORDINAL_BINS),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
