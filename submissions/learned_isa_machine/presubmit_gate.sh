@@ -9,7 +9,13 @@
 #   submissions/learned_isa_machine/.gate_hard   (hard-shape replica sweep clean)
 # Each marker must contain the sha256 of the submission.py it validated.
 set -euo pipefail
-tier="${1:?usage: presubmit_gate.sh <easy|medium|hard> [dataset]}"
+tier="${1:?usage: presubmit_gate.sh <easy|medium> [dataset]}"
+# STANDING OWNER DIRECTIVE (2026-08-08): NEVER submit to the hard tier.
+# Hard attempts, if ever made, are run manually by the repository owner only.
+if [ "$tier" = "hard" ]; then
+  echo "REFUSED: hard-tier submission is permanently disabled by owner directive."
+  exit 1
+fi
 dataset="${2:-}"
 dir="$(cd "$(dirname "$0")" && pwd)"
 sub="$dir/submission.py"

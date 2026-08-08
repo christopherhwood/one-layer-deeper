@@ -589,3 +589,10 @@ executed) were this class; every locally-replicated shape has run clean hosted.
 `presubmit_gate.sh <tier> [dataset]` refuses to submit unless `.gate_<tier>` records a
 sha256 match for a validated run. Hard gate additionally requires the width/t_min SWEEP
 (H1's shape is private — validate a range, not a point).
+
+## STANDING DIRECTIVE (2026-08-08): no Hard submissions, ever
+
+After an unauthorized, crashed Hard attempt consumed a fresh daily slot, the owner has
+permanently forbidden Hard-tier submissions by the agent. presubmit_gate.sh hard-refuses
+the tier. Hard attempts, if any, are made manually by the owner only. All agents working
+in this repo must honor this without exception.
