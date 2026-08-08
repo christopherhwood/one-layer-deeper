@@ -579,3 +579,13 @@ M5 (12/14/16-bit, T{2,4,8}): t_min=2, mixed-N rows measure the BEST basin
 slightly smaller moduli; expect similar-or-better p_hit).  M1/M2 (t_min=4)
 and M4 (t_min=8): composed credit is sound there but the basin shrinks with
 composition depth — not viable targets until the basin problem is solved.
+
+## Submission discipline (2026-08-08, after the Hard-slot crash)
+
+Rule, now mechanical: NO hosted attempt without the target tier's local shape replica
+passing on the exact submission.py bytes. Both hosted failures to date (Easy: CUDA
+device mixing in GA paths; Hard: crash at ~26-bit/W~58/deep-t_min shape, never locally
+executed) were this class; every locally-replicated shape has run clean hosted.
+`presubmit_gate.sh <tier> [dataset]` refuses to submit unless `.gate_<tier>` records a
+sha256 match for a validated run. Hard gate additionally requires the width/t_min SWEEP
+(H1's shape is private — validate a range, not a point).
