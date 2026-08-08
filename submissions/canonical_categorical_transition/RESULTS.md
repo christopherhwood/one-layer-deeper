@@ -77,6 +77,10 @@ Variable modulus is now the isolated failure. On a variable-N T=1-only
 squaring probe, training batch exact reached 69.5%, but held-out T=1 was only
 0.25% and unseen T=2 was 1.33%. The neural cell can memorize the available
 endpoint pairs but does not infer the shared modular-multiplication program.
+Extending the full E5 run from one to five CPU minutes reduced mean exact from
+1.04% to 0.625% even as training fit improved. More optimization therefore
+reinforces the wrong endpoint-specific basin rather than discovering the
+modulus-general rule.
 
 That distinguishes two regimes:
 
