@@ -4,8 +4,8 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-candidate="submissions/generic_accumulator_program/submission.py"
-expected_sha="27d909b6923e1b49e4342401a90bb26b174bc1059a1439d1e99067809568dcfa"
+candidate="submissions/generic_integer_isa/submission.py"
+expected_sha="87f8beed1c44ae168c30c41e1745c1adec02840b5dbc280aaa93c8b0a82f7636"
 actual_sha="$(shasum -a 256 "$candidate" | awk '{print $1}')"
 
 if [[ "$actual_sha" != "$expected_sha" ]]; then
@@ -13,7 +13,7 @@ if [[ "$actual_sha" != "$expected_sha" ]]; then
   exit 1
 fi
 
-.venv/bin/python -m unittest tests.test_generic_accumulator_program
+.venv/bin/python -m unittest tests.test_generic_integer_isa
 .venv/bin/one-layer validate "$candidate"
 
 manifest="benchmark/manifests/local_cpu_10s.json"

@@ -56,19 +56,46 @@ Verified evidence:
 - changed affine, cube, and `x^2+x+2` recurrence gates: 100%;
 - changed `x^3+x^2+x+1` gate: 0.833%.
 
-This is the strongest scoring candidate. It is not unambiguously compliant:
+This was the first perfect-scoring candidate. It is not unambiguously compliant:
 the learned posterior selects a program, but Python supplies exact modular
 addition, subtraction, and multiplication. Treating that as a generic ISA
 rather than a task-specific solver requires an organizer ruling under Rules 7
 and 14.
 
+## Candidate C: generic integer ISA posterior — recommended scoring artifact
+
+File: `submissions/generic_integer_isa/submission.py`
+
+SHA-256:
+
+`87f8beed1c44ae168c30c41e1745c1adec02840b5dbc280aaa93c8b0a82f7636`
+
+Candidate C removes Candidate B's automatic modular reduction. It learns five
+instructions from a generic sixteen-operation integer calculator containing
+ordinary arithmetic, divide/remainder, bitwise, min/max, and load operations.
+Remainder by N must be explicitly discovered as part of the global program.
+
+Verified evidence:
+
+- source validation and three construction/connectivity tests: pass;
+- all 80 instruction logits receive finite nonzero endpoint gradients;
+- fixed square, cube, affine, and `x^2+x+2`: 100%;
+- exact M5-shaped CPU gate: 100%, including both T=64 ladders;
+- hosted Easy E5: 100%, seen-N T=64, OOD-N T=64, 2,066 updates
+  (`36497520-7fcc-4188-b0e2-5760e8acddd6`).
+
+This is now the recommended scoring artifact because it preserves perfect
+performance while making the supplied architecture materially more general.
+It still requires the same organizer ruling: exact calculator primitives and
+finite program marginalization may still be judged a task-specific solver.
+
 ## Decision gate at 17:00 PDT
 
-1. Re-run source validation and confirm the SHA-256 of Candidate B.
-2. Submit Candidate B to hosted Medium M5 after the quota reset.
+1. Run the full preflight and confirm the SHA-256 of Candidate C.
+2. Submit Candidate C to hosted Medium M5 after the quota reset.
 3. Require 100% test/OOD and both T=64 certificates before considering its
    scoring evidence frozen.
-4. If the organizers approve the generic modular ISA, Candidate B is the
+4. If the organizers approve the generic integer ISA, Candidate C is the
    high-upside Hard artifact.
 5. Without that approval, Candidate A is the only defensible Hard artifact,
    with materially lower expected score.
@@ -78,10 +105,12 @@ and 14.
 Exact organizer question:
 
 > Do Rules 7 and 14 allow a randomly initialized, endpoint-trained global
-> posterior over a generic modular register ISA, where every opcode and operand
-> slot is learned, the initial MAP program is wrong, and the interpreter supplies
-> only add/subtract/multiply/modulo primitives? Or are the modular arithmetic
-> primitives themselves considered a prohibited task-specific solver?
+> posterior over a generic integer calculator ISA, where every instruction slot
+> is learned, the initial MAP program is wrong, modulo is an explicit learned
+> instruction, and the interpreter supplies ordinary saturating arithmetic,
+> divide/remainder, bitwise, min/max, and load primitives? Or are exact calculator
+> primitives or finite program marginalization considered a prohibited
+> task-specific solver?
 
 ## Verification commands
 
@@ -90,9 +119,9 @@ scripts/preflight_hard_candidate.sh
 # Use --full immediately before the hosted Medium/Hard decision.
 scripts/preflight_hard_candidate.sh --full
 
-shasum -a 256 submissions/generic_accumulator_program/submission.py
-.venv/bin/python -m unittest tests.test_generic_accumulator_program
-.venv/bin/one-layer validate submissions/generic_accumulator_program/submission.py
+shasum -a 256 submissions/generic_integer_isa/submission.py
+.venv/bin/python -m unittest tests.test_generic_integer_isa
+.venv/bin/one-layer validate submissions/generic_integer_isa/submission.py
 
 shasum -a 256 submissions/neural_gpu_recurrent/submission.py
 .venv/bin/python -m unittest tests.test_neural_gpu_recurrent
