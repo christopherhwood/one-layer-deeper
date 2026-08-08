@@ -360,6 +360,7 @@ class Model(nn.Module):
             value=-16.0,
         )
 
+    @torch.autocast(device_type="cuda", enabled=False)
     def forward(
         self,
         input_ids: Tensor,

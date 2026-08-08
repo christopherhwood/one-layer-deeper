@@ -37,7 +37,8 @@ NUM_DIGITS = 10
 HIDDEN = 128
 SWEEPS = 2
 MAX_OUTER_STEPS = 64
-BASE_LR = 2.0e-3
+BASE_LR = 1.0e-3
+PHASE_WEIGHT = 0.5
 
 
 class Config:
@@ -148,7 +149,10 @@ class Model(nn.Module):
         super().__init__()
         self.config = Config(spec.vocab_size, spec.max_seq_len)
         self.max_length = spec.max_seq_len
-        self.digits = max(2, (spec.max_seq_len - 5) // 2)
+        # Three markers and at least one T digit leave the remaining prompt
+        # capacity split between N and x.  Using ``-5`` drops a leading digit
+        # for even prompt lengths (for example max_seq_len=10).
+        self.digits = max(2, (spec.max_seq_len - 4) // 2)
         self.transition = CellularTransition(self.digits)
         self.training_temperature = 1.0
         self.eval_temperature = 0.10
@@ -238,6 +242,7 @@ class Model(nn.Module):
             value=-16.0,
         )
 
+    @torch.autocast(device_type="cuda", enabled=False)
     def forward(
         self,
         input_ids: Tensor,
@@ -248,9 +253,10 @@ class Model(nn.Module):
             attention_mask = input_ids != PAD
         valid = attention_mask.bool()
         modulus, register, t_values = self._parse(input_ids, valid)
-        outer_steps = (
-            3 if self.training else int(t_values.max().item())
-        )
+        # Reach every evaluator-provided endpoint during training.  A fixed
+        # three-step cap makes larger-T rows supervise the wrong state and
+        # disconnects their true endpoints from the loss.
+        outer_steps = int(t_values.max().item())
         temperature = (
             self.training_temperature if self.training else self.eval_temperature
         )
@@ -305,11 +311,13 @@ def _masked_cross_entropy(logits: Tensor, batch: TokenLossBatch) -> Tensor:
 
 def token_training_loss(batch: TokenLossBatch) -> Tensor:
     endpoint = _masked_cross_entropy(batch.logits, batch)
+    if PHASE_WEIGHT == 0.0:
+        return endpoint
     phases = [
         _masked_cross_entropy(_target_aligned(phase, batch), batch)
         for phase in batch.auxiliary["phase_logits"]
     ]
-    return endpoint + 0.5 * torch.stack(phases).mean()
+    return endpoint + PHASE_WEIGHT * torch.stack(phases).mean()
 
 
 class WallClockSchedule:
