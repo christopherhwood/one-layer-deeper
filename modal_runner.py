@@ -26,6 +26,13 @@ APP_NAME = "one-layer-benchmark-runner"
 REMOTE_ROOT = "/workspace/one-layer-benchmark"
 SUBMISSION_FUNCTION_NAME = "evaluate_submission"
 SUBMISSION_MANIFEST_TIMEOUTS = submission_manifest_timeouts()
+PRIVATE_MANIFEST_TIMEOUTS = {
+    "h100_hidden_affine_medium_m1.json": 1200,
+}
+EVALUATION_MANIFEST_TIMEOUTS = {
+    **SUBMISSION_MANIFEST_TIMEOUTS,
+    **PRIVATE_MANIFEST_TIMEOUTS,
+}
 
 SMOKE_MANIFEST_FILENAME = "h100_easy_e1.json"
 SMOKE_SUBMISSION_FILE = "submissions/baseline_adamw/submission.py"
@@ -45,17 +52,19 @@ GPU_FUNCTIONS = {gpu: function_name for gpu, (function_name, _) in GPU_CONFIGS.i
 app = modal.App(APP_NAME)
 
 image = (
-    modal.Image.from_registry("nvidia/cuda:12.9.1-devel-ubuntu24.04", add_python="3.13")
-    .apt_install("git", "build-essential")
-    .pip_install("uv==0.11.3")
+    # The configured workspace's legacy Modal bootstrap does not support
+    # Python 3.13.  The evaluator itself uses only Torch and NumPy, so keep this
+    # private diagnostic image on the newest compatible interpreter while
+    # pinning the same numerical runtime as the official environment.
+    modal.Image.from_registry("python:3.11-bookworm")
+    .pip_install(
+        "torch==2.12.1",
+        "numpy==2.4.6",
+        "jsonargparse==4.49.0",
+    )
     .env({"PYTHONPATH": REMOTE_ROOT})
     .run_commands(f"mkdir -p {REMOTE_ROOT}")
-    .add_local_file("pyproject.toml", f"{REMOTE_ROOT}/pyproject.toml", copy=True)
-    .add_local_file("uv.lock", f"{REMOTE_ROOT}/uv.lock", copy=True)
     .add_local_file("submission_validation.py", f"{REMOTE_ROOT}/submission_validation.py", copy=True)
-    .run_commands(
-        f"cd {REMOTE_ROOT} && uv sync --frozen --no-install-project",
-    )
     .add_local_dir(
         "benchmark",
         f"{REMOTE_ROOT}/benchmark",
@@ -82,8 +91,26 @@ image = (
         f"{REMOTE_ROOT}/scripts/generate_datasets.sh",
         copy=True,
     )
+    .add_local_file(
+        "scripts/generate_hidden_recurrence_probe.py",
+        f"{REMOTE_ROOT}/scripts/generate_hidden_recurrence_probe.py",
+        copy=True,
+    )
+    .add_local_file(
+        "benchmark/manifests/h100_hidden_affine_medium_m1.json",
+        f"{REMOTE_ROOT}/benchmark/manifests/h100_hidden_affine_medium_m1.json",
+        copy=True,
+    )
     .run_commands(
-        f"cd {REMOTE_ROOT} && uv run --no-sync bash scripts/generate_datasets.sh",
+        f"cd {REMOTE_ROOT} && bash scripts/generate_datasets.sh",
+        f"cd {REMOTE_ROOT} && python scripts/generate_hidden_recurrence_probe.py "
+        "affine data/generated/hidden_affine_medium_m1 "
+        "--fixed-p 101 --fixed-q 103 "
+        "--time-steps 4 8 16 --ood-time-steps 32 "
+        "--examples-per-setting 10000 --ood-examples-per-setting 3000 "
+        "--train-fraction 0.9 --test-fraction 0.1 "
+        "--depth-time-steps 1 2 4 8 16 32 64 --depth-examples 192 "
+        "--ood-n-bits 15 16 --ood-n-examples 256",
     )
     .add_local_python_source("modal_runner")
 )
@@ -185,17 +212,42 @@ def _run_command(command: list[str], timeout_seconds: int = DEFAULT_TIMEOUT_SECO
     }
 
 
-def _register_gpu_function(name: str, gpu: str) -> modal.Function:
-    @app.function(gpu=gpu, image=image, timeout=MAX_TIMEOUT_SECONDS, serialized=True, name=name)
-    def run(command: list[str], timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS) -> dict[str, Any]:
-        return _run_command(command, timeout_seconds)
+# Keep these as top-level, source-imported functions.  Nested serialized
+# functions cannot cross this client's Python 3.13 / image Python 3.11 boundary.
+@app.function(
+    gpu=GPU_CONFIGS["A100"][1],
+    image=image,
+    timeout=MAX_TIMEOUT_SECONDS,
+    name=GPU_CONFIGS["A100"][0],
+)
+def run_a100(
+    command: list[str], timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+) -> dict[str, Any]:
+    return _run_command(command, timeout_seconds)
 
-    return run
+
+@app.function(
+    gpu=GPU_CONFIGS["H100"][1],
+    image=image,
+    timeout=MAX_TIMEOUT_SECONDS,
+    name=GPU_CONFIGS["H100"][0],
+)
+def run_h100(
+    command: list[str], timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+) -> dict[str, Any]:
+    return _run_command(command, timeout_seconds)
 
 
-run_a100 = _register_gpu_function(*GPU_CONFIGS["A100"])
-run_h100 = _register_gpu_function(*GPU_CONFIGS["H100"])
-run_b200 = _register_gpu_function(*GPU_CONFIGS["B200"])
+@app.function(
+    gpu=GPU_CONFIGS["B200"][1],
+    image=image,
+    timeout=MAX_TIMEOUT_SECONDS,
+    name=GPU_CONFIGS["B200"][0],
+)
+def run_b200(
+    command: list[str], timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+) -> dict[str, Any]:
+    return _run_command(command, timeout_seconds)
 
 
 def _parse_benchmark_result(log_tail: str) -> dict[str, Any]:
@@ -210,7 +262,6 @@ def _parse_benchmark_result(log_tail: str) -> dict[str, Any]:
     image=image,
     timeout=MAX_TIMEOUT_SECONDS,
     block_network=True,
-    serialized=True,
     name=SUBMISSION_FUNCTION_NAME,
 )
 def evaluate_submission(
@@ -220,7 +271,7 @@ def evaluate_submission(
 ) -> dict[str, Any]:
     """Evaluate one uploaded source file in a disposable H100 container."""
 
-    expected_timeout = SUBMISSION_MANIFEST_TIMEOUTS.get(manifest_filename)
+    expected_timeout = EVALUATION_MANIFEST_TIMEOUTS.get(manifest_filename)
     if expected_timeout is None:
         raise ValueError(f"manifest is not available for submissions: {manifest_filename}")
     if timeout_seconds != expected_timeout:
@@ -302,7 +353,7 @@ def smoke(
     submission_file: str = SMOKE_SUBMISSION_FILE,
     manifest_filename: str = SMOKE_MANIFEST_FILENAME,
 ) -> None:
-    expected_timeout = SUBMISSION_MANIFEST_TIMEOUTS.get(manifest_filename)
+    expected_timeout = EVALUATION_MANIFEST_TIMEOUTS.get(manifest_filename)
     if expected_timeout is None:
         raise ValueError(f"unknown smoke manifest: {manifest_filename}")
     source_path = Path(submission_file)
