@@ -86,6 +86,10 @@ Exact organizer question:
 ## Verification commands
 
 ```bash
+scripts/preflight_hard_candidate.sh
+# Use --full immediately before the hosted Medium/Hard decision.
+scripts/preflight_hard_candidate.sh --full
+
 shasum -a 256 submissions/generic_accumulator_program/submission.py
 .venv/bin/python -m unittest tests.test_generic_accumulator_program
 .venv/bin/one-layer validate submissions/generic_accumulator_program/submission.py
