@@ -65,7 +65,11 @@ transition, and the same weights can generalize to an unseen recurrence depth.
 
 The fixed-N ten-second smoke also improved from 13.67% before the repairs to
 21.83%. On the full public E1 geometry, one CPU minute reached 31.17% mean
-exact across ordinary and OOD-T evaluation.
+exact across ordinary and OOD-T evaluation. Extending that same run to five
+minutes reached 90.6% batch exact, 57.33% held-out exact, and 55.0% at unseen
+T=6 (56.17% mean). The learned transition therefore continues improving well
+beyond the short smoke budget, although it is not yet exact enough to certify
+an entire depth rung.
 
 ## Remaining frontier
 
